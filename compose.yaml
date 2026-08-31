@@ -1,0 +1,12 @@
+services:
+  walnut:
+    build: .
+    ports:
+      - "127.0.0.1:8766:8766"
+    volumes:
+      - ./data:/app/data
+      - ./.env:/app/.env
+    environment:
+      WALNUT_WEB_HOST: "0.0.0.0"
+      WALNUT_WEB_PORT: "8766"
+      WALNUT_DATA_DIR: "/app/data"
