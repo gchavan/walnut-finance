@@ -11,7 +11,8 @@ that port to the network.
 
 - **Overview** — net worth, this-month spend vs last month, upcoming recurring
 - **Transactions** — cash and cards. Pending rows are listed but not spend. Brokerage trades are hidden here (they still count toward net worth)
-- **Spending** — this month / last month / custom range, 6-month bars, category donut, click a slice to recategorize
+- **Investments** — holdings across investment accounts (and crypto)
+- **Spending** — Summary (6-month bars + category pie), By category (stacked subcategory bars with include checkboxes), and Highlights (frequent / largest). Rules support optional subcategories that retag matching payees
 - **Retirement / Net worth** — household, per-person, assets vs liabilities, Blueprint map
 - **Settings** — App (SimpleFIN token + Demo mode), Household (you, partner, kids), Accounts, Categories, Rules
 - **Recurring** — local detector (same payee, similar amount, regular interval)

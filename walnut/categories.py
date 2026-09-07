@@ -43,32 +43,59 @@ DEFAULT_TAGS = (
 )
 
 # Substring (normalized) → tag. Applied on first boot if category_rules is empty.
-SEED_RULES: tuple[tuple[str, str], ...] = (
+SEED_RULES: tuple[tuple[str, ...], ...] = (
+    ("GONG CHA", "Dining & Drinks"),
     ("DOORDASH", "Dining & Drinks"),
-    ("CHIPOTLE", "Dining & Drinks"),
+    ("BOMBAY WALAA", "Dining & Drinks"),
     ("DOMINO", "Dining & Drinks"),
+    ("CHIPOTLE", "Dining & Drinks"),
+    ("ANGEL DONUTS", "Dining & Drinks"),
+    ("BANGALORE TIFFIN", "Dining & Drinks"),
+    ("DESI CHAAT", "Dining & Drinks"),
+    ("DESI CIRCLE", "Dining & Drinks"),
     ("JIMMY JOHN", "Dining & Drinks"),
-    ("STARBUCKS", "Dining & Drinks"),
-    ("MCDONALD", "Dining & Drinks"),
+    ("MILK + TEA", "Dining & Drinks"),
+    ("NEED FOR SWEET", "Dining & Drinks"),
+    ("SHAHGHOUSE", "Dining & Drinks"),
+    ("MENDOCINO", "Dining & Drinks"),
+    ("H-E-B", "Groceries"),
+    ("HEB", "Groceries"),
     ("INSTACART", "Groceries"),
+    ("MANPASAND", "Groceries"),
     ("COSTCO", "Groceries"),
-    ("WHOLE FOODS", "Groceries"),
     ("WHOLEFD", "Groceries"),
-    ("WALMART", "Groceries"),
-    ("TRADER JOE", "Groceries"),
+    ("WHOLE FOODS", "Groceries"),
+    ("HCTRA", "Auto & Transport"),
+    ("EZ TAG", "Auto & Transport"),
+    ("CHARGEPOINT", "Auto & Transport"),
     ("UBER *TRIP", "Auto & Transport"),
-    ("LYFT", "Auto & Transport"),
+    ("TESLA SUBSCRIPTION", "Auto & Transport"),
     ("AMAZON", "Shopping"),
-    ("TARGET", "Shopping"),
+    ("CINEPOLIS", "Entertainment & Rec."),
+    ("TYPHOON", "Entertainment & Rec."),
     ("APPLE.COM", "Entertainment & Rec."),
     ("NETFLIX", "Entertainment & Rec."),
     ("YOUTUBE", "Entertainment & Rec."),
-    ("SPOTIFY", "Entertainment & Rec."),
+    ("SLING", "Entertainment & Rec."),
+    ("ZILKER", "Entertainment & Rec."),
+    ("AUSTINPICK", "Health & Wellness"),
+    ("FOUR POINTS", "Health & Wellness"),
+    ("YMCA", "Health & Wellness"),
+    ("BRIGHT HORIZONS", "Family Care"),
+    ("TRUGREEN", "Home & Garden"),
     ("HOME DEPOT", "Home & Garden"),
+    ("POOL POLICE", "Home & Garden"),
+    ("APTIVE", "Home & Garden"),
+    ("OSRX", "Medical"),
     ("GOOGLE ONE", "Software & Tech"),
     ("OPENAI", "Software & Tech"),
     ("CHATGPT", "Software & Tech"),
+    ("ZENBUSINESS", "Software & Tech"),
+    ("ART + ACADEMY", "Education"),
+    ("ART ACADEMY", "Education"),
     ("SPECTRUM", "Bills & Utilities"),
+    ("BRITISH AIRWAYS", "Travel & Vacation"),
+    ("SPOTIFY", "Entertainment & Rec.", "Music"),
 )
 
 _PROCESSOR_PREFIX = re.compile(
@@ -78,9 +105,11 @@ _PROCESSOR_PREFIX = re.compile(
 
 # Longer first so "CEDAR PARK" wins over leftover tokens.
 _TRAILING_CITIES = (
-    "SAN FRANCISCO", "LOS ANGELES", "SAN ANTONIO", "FORT WORTH",
-    "NEW YORK", "SAN JOSE", "AUSTIN", "HOUSTON", "DALLAS",
-    "ATLANTA", "MIAMI", "SEATTLE", "DENVER", "PHOENIX", "CHICAGO",
+    "SAN FRANCISCO", "LOS ANGELES", "SAN ANTONIO", "FORT WORTH", "CEDAR PARK",
+    "ROUND ROCK", "NEW YORK", "SAN JOSE", "BEE CAVE", "WEST LAKE",
+    "PFLUGERVILLE", "AUSTIN", "HOUSTON", "DALLAS", "PLANO", "IRVING",
+    "LEANDER", "LAKEWAY", "ATLANTA", "MIAMI", "SEATTLE", "DENVER",
+    "PHOENIX", "CHICAGO",
 )
 
 _EMPTY_CATS = frozenset(("", "uncategorized", "uncategorised"))
@@ -123,27 +152,40 @@ def _rule_id(pattern: str) -> str:
     return hashlib.sha256(pattern.encode("utf-8")).hexdigest()[:20]
 
 
+def _norm_subcategory(subcategory: str | None) -> str | None:
+    s = (subcategory or "").strip()
+    if not s or s.lower() in ("other", "uncategorized"):
+        return None
+    if len(s) > 80:
+        raise ValueError("subcategory is too long")
+    return s
+
+
 def upsert_rule(
     conn: sqlite3.Connection,
     pattern: str,
     category: str,
     source: str,
+    *,
+    subcategory: str | None = None,
 ) -> str:
     key = normalize_payee(pattern) or (pattern or "").strip().upper()
     if not key:
         raise ValueError("pattern is empty after normalize")
     rid = _rule_id(key)
+    sub = _norm_subcategory(subcategory)
     conn.execute(
         """
-        INSERT INTO category_rules (rule_id, pattern, category, source, updated_at_ms)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO category_rules (rule_id, pattern, category, subcategory, source, updated_at_ms)
+        VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(rule_id) DO UPDATE SET
             pattern = excluded.pattern,
             category = excluded.category,
+            subcategory = excluded.subcategory,
             source = excluded.source,
             updated_at_ms = excluded.updated_at_ms
         """,
-        (rid, key, category, source, db.now_ms()),
+        (rid, key, category, sub, source, db.now_ms()),
     )
     return rid
 
@@ -157,17 +199,24 @@ def list_rules(conn: sqlite3.Connection) -> list[dict]:
 def ensure_seeded(conn: sqlite3.Connection) -> int:
     """Insert seed rules if the table is empty. Returns number inserted."""
     n = int(conn.execute("SELECT COUNT(*) FROM category_rules").fetchone()[0])
-    if n:
-        return 0
     added = 0
-    for pattern, category in SEED_RULES:
-        upsert_rule(conn, pattern, category, "seed")
+    if not n:
+        for item in SEED_RULES:
+            pattern, category = item[0], item[1]
+            sub = item[2] if len(item) > 2 else None
+            upsert_rule(conn, pattern, category, "seed", subcategory=sub)
+            added += 1
+        logger.info("seeded %s category rules", added)
+    spotify = conn.execute(
+        "SELECT rule_id FROM category_rules WHERE pattern = 'SPOTIFY'"
+    ).fetchone()
+    if not spotify:
+        upsert_rule(conn, "SPOTIFY", "Entertainment & Rec.", "seed", subcategory="Music")
         added += 1
-    logger.info("seeded %s category rules", added)
     return added
 
 
-def match_category(payee: str | None, rules: list[dict]) -> str | None:
+def match_rule(payee: str | None, rules: list[dict]) -> dict | None:
     key = normalize_payee(payee)
     if not key:
         return None
@@ -176,8 +225,13 @@ def match_category(payee: str | None, rules: list[dict]) -> str | None:
         if not pat:
             continue
         if pat == key or pat in key:
-            return rule.get("category")
+            return rule
     return None
+
+
+def match_category(payee: str | None, rules: list[dict]) -> str | None:
+    rule = match_rule(payee, rules)
+    return None if not rule else rule.get("category")
 
 
 def apply_to_uncategorized(conn: sqlite3.Connection) -> int:
@@ -205,12 +259,14 @@ def apply_to_uncategorized(conn: sqlite3.Connection) -> int:
     for row in rows:
         if db.account_is_investment_spend(row["account_name"], row["group_key"]):
             continue
-        cat = match_category(row["payee"], rules)
+        rule = match_rule(row["payee"], rules)
+        cat = (rule or {}).get("category")
         if not cat or cat == "Uncategorized":
             continue
+        sub = _norm_subcategory((rule or {}).get("subcategory"))
         conn.execute(
-            "UPDATE transactions SET category_name = ? WHERE transaction_id = ?",
-            (cat, row["transaction_id"]),
+            "UPDATE transactions SET category_name = ?, subcategory = ? WHERE transaction_id = ?",
+            (cat, sub, row["transaction_id"]),
         )
         n += 1
     if n:
@@ -305,13 +361,15 @@ def apply_to_matching(
     category: str,
     cluster_key: str | None = None,
     pattern: str | None = None,
+    subcategory: str | None = None,
 ) -> dict:
-    """Write category_name on matching spending txns and upsert a user rule."""
+    """Write category_name + subcategory on matching spending txns and upsert a user rule."""
     category = (category or "").strip()
     if not category:
         raise ValueError("category is required")
     if len(category) > 80:
         raise ValueError("category is too long")
+    sub = _norm_subcategory(subcategory)
     key = (cluster_key or "").strip()
     pat_raw = (pattern or "").strip()
     if not key and not pat_raw:
@@ -340,23 +398,32 @@ def apply_to_matching(
         if not hit:
             continue
         conn.execute(
-            "UPDATE transactions SET category_name = ? WHERE transaction_id = ?",
-            (category, row["transaction_id"]),
+            "UPDATE transactions SET category_name = ?, subcategory = ? WHERE transaction_id = ?",
+            (category, sub, row["transaction_id"]),
         )
         n += 1
-    rid = upsert_rule(conn, match_pat, category, "user")
+    rid = upsert_rule(conn, match_pat, category, "user", subcategory=sub)
     extra = apply_to_uncategorized(conn)
     if category.strip().lower() == "transfer (not spend)":
         db.recompute_spending(conn)
-    return {"ok": True, "n": n, "n_rules_applied": extra, "rule_id": rid, "category": category, "pattern": match_pat}
+    return {
+        "ok": True, "n": n, "n_rules_applied": extra, "rule_id": rid,
+        "category": category, "subcategory": sub, "pattern": match_pat,
+    }
 
 
-def tag_one(conn: sqlite3.Connection, transaction_id: str, category: str) -> dict:
+def tag_one(
+    conn: sqlite3.Connection,
+    transaction_id: str,
+    category: str,
+    subcategory: str | None = None,
+) -> dict:
     category = (category or "").strip()
     if not category:
         raise ValueError("category is required")
     if len(category) > 80:
         raise ValueError("category is too long")
+    sub = _norm_subcategory(subcategory)
     tid = (transaction_id or "").strip()
     if not tid:
         raise ValueError("transaction_id is required")
@@ -367,17 +434,45 @@ def tag_one(conn: sqlite3.Connection, transaction_id: str, category: str) -> dic
     if not row:
         raise KeyError("transaction not found")
     conn.execute(
-        "UPDATE transactions SET category_name = ? WHERE transaction_id = ?",
-        (category, tid),
+        "UPDATE transactions SET category_name = ?, subcategory = ? WHERE transaction_id = ?",
+        (category, sub, tid),
     )
     if category.lower() == "transfer (not spend)":
         db.recompute_spending(conn)
-    return {"ok": True, "transaction_id": tid, "category": category}
+    return {"ok": True, "transaction_id": tid, "category": category, "subcategory": sub}
+
+
+def _subcategories_payload(conn: sqlite3.Connection) -> dict[str, list[str]]:
+    """category -> sorted unique named slots (rules + txns)."""
+    out: dict[str, set[str]] = {}
+    for row in conn.execute(
+        """
+        SELECT category, subcategory FROM category_rules
+        WHERE subcategory IS NOT NULL AND TRIM(subcategory) != ''
+        """
+    ):
+        cat = (row[0] or "").strip()
+        sub = (row[1] or "").strip()
+        if cat and sub:
+            out.setdefault(cat, set()).add(sub)
+    for row in conn.execute(
+        """
+        SELECT category_name, subcategory FROM transactions
+        WHERE subcategory IS NOT NULL AND TRIM(subcategory) != ''
+          AND category_name IS NOT NULL AND TRIM(category_name) != ''
+        """
+    ):
+        cat = (row[0] or "").strip()
+        sub = (row[1] or "").strip()
+        if cat and sub:
+            out.setdefault(cat, set()).add(sub)
+    return {k: sorted(v, key=str.lower) for k, v in sorted(out.items(), key=lambda kv: kv[0].lower())}
 
 
 def payload(conn: sqlite3.Connection, *, uncategorized_only: bool = True) -> dict:
     return {
         "tags": _tags_payload(conn),
+        "subcategories": _subcategories_payload(conn),
         "clusters": clusters(conn, uncategorized_only=uncategorized_only),
         "rules": list_rules(conn),
         "suggestions": visible_suggestions(conn),
@@ -421,13 +516,14 @@ def update_rule(
     *,
     category: str | None = None,
     pattern: str | None = None,
+    subcategory: str | None | object = ...,
 ) -> dict:
-    """Change a rule's category and/or pattern in place, then retag matches."""
+    """Change a rule's category/pattern/subcategory in place, then retag matches."""
     rid = (rule_id or "").strip()
     if not rid:
         raise ValueError("rule_id is required")
     row = conn.execute(
-        "SELECT rule_id, pattern, category, source FROM category_rules WHERE rule_id = ?",
+        "SELECT rule_id, pattern, category, subcategory, source FROM category_rules WHERE rule_id = ?",
         (rid,),
     ).fetchone()
     if not row:
@@ -441,10 +537,16 @@ def update_rule(
     new_key = normalize_payee(raw) or (str(raw or "").strip().upper())
     if not new_key:
         raise ValueError("pattern is empty after normalize")
+    if subcategory is ...:
+        new_sub = row["subcategory"] if "subcategory" in row.keys() else None
+    else:
+        new_sub = subcategory
     old_key = row["pattern"] or ""
     if new_key != old_key:
         delete_rule(conn, rule_id=rid)
-    return apply_to_matching(conn, category=new_cat, pattern=new_key)
+    return apply_to_matching(
+        conn, category=new_cat, pattern=new_key, subcategory=new_sub,
+    )
 
 
 def _cash_card_txns(conn: sqlite3.Connection) -> list[sqlite3.Row]:

@@ -27,8 +27,16 @@ from .config import Config, upsert_env_var
 logger = logging.getLogger("walnut.simplefin")
 
 _TIMEOUT = aiohttp.ClientTimeout(total=120, sock_connect=20, sock_read=90)
-_DEFAULT_HISTORY_DAYS = 90
+# SimpleFIN counts an inclusive calendar window. now UTC minus 90 days is 91
+# dates (start day through today), so they reply "exceeds limit of 90 days
+# and was capped." 89 calendar days is the usual SimpleFIN-safe request.
+_DEFAULT_HISTORY_DAYS = 89
 _CREATE_URL = "https://bridge.simplefin.org/simplefin/create"
+
+_REDACT_KEY_NEEDLES = (
+    "accessurl", "simplefinaccessurl", "password", "passwd",
+    "userinfo", "setuptoken",
+)
 
 _CARD_NEEDLES = (
     "credit card", "creditcard", "line of credit", "lineofcredit",
@@ -202,6 +210,87 @@ def _org_for_account(raw: dict, connections: dict[str, dict]) -> str:
     if isinstance(org, dict):
         return str(org.get("name") or org.get("domain") or "")
     return ""
+
+
+def is_coverage_notice(msg: str | None) -> bool:
+    """90-day / range-capped SimpleFIN messages are coverage, not errors."""
+    text = str(msg or "").lower()
+    if "90 day" in text or "90 days" in text:
+        return True
+    if "date range exceeds" in text:
+        return True
+    if "was capped" in text and ("range" in text or "date" in text or "limit" in text):
+        return True
+    return False
+
+
+def split_errlist(items: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Return (errors, coverage_notices)."""
+    errors: list[dict] = []
+    notices: list[dict] = []
+    for e in items or []:
+        msg = e.get("msg") if isinstance(e, dict) else str(e)
+        if is_coverage_notice(msg):
+            notices.append(e)
+        else:
+            errors.append(e)
+    return errors, notices
+
+
+def _secret_key(key: str) -> bool:
+    compact = re.sub(r"[^a-z0-9]", "", str(key).lower())
+    return compact in _REDACT_KEY_NEEDLES or compact.endswith("accessurl")
+
+
+def redact_for_dump(obj: Any) -> Any:
+    """Strip Access URL, userinfo, password, and setup token from a payload copy."""
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if _secret_key(str(k)):
+                out[k] = "[redacted]"
+            else:
+                out[k] = redact_for_dump(v)
+        return out
+    if isinstance(obj, list):
+        return [redact_for_dump(x) for x in obj]
+    if isinstance(obj, str):
+        if "://" in obj and "@" in obj:
+            return redact_url(obj)
+        return obj
+    return obj
+
+
+def holdings_inspect_payload(payload: dict | None) -> list:
+    """Accounts with name/id/balance plus raw holdings arrays, secrets stripped."""
+    out: list = []
+    for acct in (payload or {}).get("accounts") or []:
+        if not isinstance(acct, dict):
+            continue
+        out.append({
+            "id": acct.get("id"),
+            "name": acct.get("name"),
+            "balance": acct.get("balance"),
+            "holdings": acct.get("holdings") or [],
+        })
+    return redact_for_dump(out)
+
+
+def _write_json_0600(path, data: Any) -> None:
+    text = json.dumps(data, indent=2, default=str)
+    if not text.endswith("\n"):
+        text += "\n"
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def write_last_sync_dumps(cfg: Config, payload: dict | None) -> None:
+    """Write gitignored last-sync JSON for inspection. Never log secrets."""
+    cfg.ensure_dirs()
+    body = payload if isinstance(payload, dict) else {}
+    _write_json_0600(cfg.data_dir / "simplefin-last-sync.json", redact_for_dump(body))
+    _write_json_0600(cfg.data_dir / "simplefin-last-holdings.json", holdings_inspect_payload(body))
 
 
 def normalize_errlist(payload: dict | None) -> list[dict]:
@@ -390,6 +479,13 @@ def persist_account_set(conn, payload: dict) -> tuple[int, int, int]:
             except (TypeError, ValueError):
                 rec["updated_at_ms"] = ts
         db.upsert_account(conn, rec)
+        persist_holdings(
+            conn,
+            raw.get("holdings") or [],
+            raw_account_id=raw_aid,
+            account_id=account_id,
+            ts=ts,
+        )
         a, m, r = persist_transactions(
             conn,
             raw.get("transactions") or [],
@@ -406,6 +502,112 @@ def persist_account_set(conn, payload: dict) -> tuple[int, int, int]:
         if bal_ts:
             db.set_meta(conn, f"balance_date_{account_id}", bal_ts)
     return n_added, n_modified, n_removed
+
+
+
+def _holding_extra(raw: dict) -> dict:
+    extra = raw.get("extra")
+    return extra if isinstance(extra, dict) else {}
+
+
+def _holding_created(raw: dict) -> str | None:
+    extra = _holding_extra(raw)
+    vals = []
+    for src in (raw, extra):
+        # MX created is snapshot day, not purchase date.
+        for key in ("purchase_date", "acquired", "purchased", "purchase-date"):
+            val = src.get(key)
+            if val not in (None, ""):
+                vals.append(val)
+    for val in vals:
+        iso = unix_to_date(val)
+        if iso:
+            return iso
+        s = str(val).strip()
+        m = re.match(r"^(\d{4}-\d{2}-\d{2})", s)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _shares_float(raw: dict) -> float | None:
+    val = raw.get("shares")
+    extra = _holding_extra(raw)
+    if val in (None, ""):
+        val = extra.get("shares") or extra.get("quantity") or extra.get("qty")
+    if val in (None, ""):
+        return None
+    try:
+        n = float(val)
+    except (TypeError, ValueError):
+        return None
+    if n == 0:
+        return None
+    return n
+
+
+def _holding_cost_basis(raw: dict) -> int | None:
+    extra = _holding_extra(raw)
+    for src in (raw, extra):
+        for key in ("cost_basis", "basis", "cost-basis", "costBasis"):
+            cents = db.money_string_to_cents(src.get(key))
+            if cents:
+                return cents
+    pp = None
+    for src in (raw, extra):
+        for key in ("purchase_price", "purchasePrice", "purchase-price"):
+            pp = db.money_string_to_cents(src.get(key))
+            if pp:
+                break
+        if pp:
+            break
+    shares = _shares_float(raw)
+    if pp and shares:
+        return int(round(pp * shares))
+    for src in (raw, extra):
+        for key in ("cost_basis", "basis", "cost-basis", "costBasis"):
+            cents = db.money_string_to_cents(src.get(key))
+            if cents is not None:
+                return cents
+    return None
+
+
+def persist_holdings(
+    conn,
+    holdings: list,
+    *,
+    raw_account_id: str,
+    account_id: str,
+    ts: int,
+) -> None:
+    recs: list[dict] = []
+    for raw in holdings or []:
+        if not isinstance(raw, dict) or not raw.get("id"):
+            continue
+        raw_hid = str(raw["id"])
+        shares = raw.get("shares")
+        if shares is None or shares == "":
+            shares_s = None
+        else:
+            shares_s = str(shares)
+        created = _holding_created(raw)
+        currency = raw.get("currency") or None
+        if isinstance(currency, str) and currency.startswith("http"):
+            currency = "USD"
+        recs.append({
+            "holding_id": f"sfin-hold:{raw_account_id}:{raw_hid}",
+            "account_id": account_id,
+            "symbol": (str(raw["symbol"]).strip() if raw.get("symbol") not in (None, "") else None),
+            "description": (str(raw["description"]) if raw.get("description") not in (None, "") else None),
+            "shares": shares_s,
+            "market_value_cents": db.money_string_to_cents(raw.get("market_value")),
+            "cost_basis_cents": _holding_cost_basis(raw),
+            "purchase_price_cents": db.money_string_to_cents(raw.get("purchase_price")),
+            "currency": currency,
+            "created": created,
+            "updated_at_ms": ts,
+        })
+    db.replace_account_holdings(conn, account_id, recs)
 
 
 def persist_transactions(
@@ -439,8 +641,12 @@ def persist_transactions(
             (tid,),
         ).fetchone()
         cat = None
+        sub = None
         if not existed and not db.account_is_investment_spend(account_name, group_key):
-            cat = cats.apply_category_to_new(payee, None, rules)
+            rule = cats.match_rule(payee, rules)
+            if rule and rule.get("category") and rule.get("category") != "Uncategorized":
+                cat = rule.get("category")
+                sub = cats._norm_subcategory(rule.get("subcategory"))
         rec = {
             "transaction_id": tid,
             "account_id": account_id,
@@ -452,6 +658,7 @@ def persist_transactions(
             "memo": raw.get("memo") if isinstance(raw.get("memo"), str) else None,
             "category_id": None,
             "category_name": cat,
+            "subcategory": sub,
             "transfer_account_id": None,
             "is_transfer": 0,
             "is_spending": db.is_spending_flag(
@@ -503,6 +710,7 @@ async def sync_all(cfg: Config, conn) -> dict:
     start_iso = datetime.fromtimestamp(start_unix, tz=timezone.utc).date().isoformat()
     errors: list[str] = []
     errlist: list[dict] = []
+    notices: list[dict] = []
     n_added = n_modified = n_removed = 0
 
     try:
@@ -523,6 +731,11 @@ async def sync_all(cfg: Config, conn) -> dict:
             "source": "simplefin",
         }
 
+    try:
+        write_last_sync_dumps(cfg, payload)
+    except OSError as exc:
+        logger.warning("could not write simplefin last-sync dump: %s", type(exc).__name__)
+
     orig_sync_id = sync_id
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -541,7 +754,8 @@ async def sync_all(cfg: Config, conn) -> dict:
         n_added, n_modified, n_removed = persist_account_set(conn, payload)
         db.recompute_spending(conn)
         cats.apply_to_uncategorized(conn)
-        errlist = normalize_errlist(payload)
+        raw_errlist = normalize_errlist(payload)
+        errlist, notices = split_errlist(raw_errlist)
         db.set_meta(conn, "simplefin_errlist", json.dumps(errlist))
         conn.execute("COMMIT")
     except Exception as exc:
@@ -584,6 +798,7 @@ async def sync_all(cfg: Config, conn) -> dict:
         "n_removed": n_removed,
         "errors": errors,
         "errlist": errlist,
+        "notices": notices,
         "coverage": cov,
         "n_accounts": db.account_count(conn),
         "source": "simplefin",

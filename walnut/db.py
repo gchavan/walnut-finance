@@ -82,6 +82,7 @@ CREATE TABLE IF NOT EXISTS transactions (
     memo                    TEXT,
     category_id             TEXT,
     category_name           TEXT,
+    subcategory             TEXT,
     transfer_account_id     TEXT,
     is_transfer             INTEGER NOT NULL DEFAULT 0,
     is_spending             INTEGER NOT NULL DEFAULT 0,
@@ -146,6 +147,7 @@ CREATE TABLE IF NOT EXISTS category_rules (
     rule_id           TEXT PRIMARY KEY,
     pattern           TEXT NOT NULL,
     category          TEXT NOT NULL,
+    subcategory       TEXT,
     source            TEXT,
     updated_at_ms     INTEGER NOT NULL
 );
@@ -180,6 +182,21 @@ CREATE TABLE IF NOT EXISTS loan_terms (
     rate_bps          INTEGER NOT NULL,
     term_months       INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS holdings (
+    holding_id           TEXT PRIMARY KEY,
+    account_id           TEXT NOT NULL,
+    symbol               TEXT,
+    description          TEXT,
+    shares               TEXT,
+    market_value_cents   INTEGER,
+    cost_basis_cents     INTEGER,
+    purchase_price_cents INTEGER,
+    currency             TEXT,
+    created              TEXT,
+    updated_at_ms        INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_holdings_acct ON holdings(account_id);
 """
 
 _STARTING_BALANCE_PAYEES = (
@@ -194,21 +211,38 @@ _RETIREMENT_NEEDLES = (
 )
 _INVEST_NEEDLES = (
     "robinhood", "brokerage", "crypto", "investment", "broker", "stock",
-    "etf", "mutual",
+    "etf", "mutual", "529",
 )
 
 _SEED_PEOPLE = (
     ("You", "self", 0),
 )
-KNOWN_ACCOUNT_CATEGORIES = (
-    "Checking", "Savings", "Credit card", "Taxable",
-    "401(k)", "Roth IRA", "Traditional IRA", "HSA", "Crypto",
-    "Mortgage", "Auto loan", "Student loan", "Other",
+# Single catalog for account types. JS reads this from /api/status.
+# kind: cash | invest | loan | other. color is for cluster UI.
+ACCOUNT_TYPES = (
+    ("Checking", "cash", "#4c6fd6"),
+    ("Savings", "cash", "#3d9a62"),
+    ("Credit card", "cash", "#d1444a"),
+    ("Taxable", "invest", "#2d8a9e"),
+    ("401(k)", "invest", "#8b6cc7"),
+    ("Roth IRA", "invest", "#2a9d8f"),
+    ("Traditional IRA", "invest", "#6d72c3"),
+    ("HSA", "invest", "#3d7ea6"),
+    ("529", "invest", "#c4a35a"),
+    ("Crypto", "invest", "#e07040"),
+    ("Mortgage", "loan", "#5c7c99"),
+    ("Auto loan", "loan", "#5c7c99"),
+    ("Student loan", "loan", "#5c7c99"),
+    ("Other", "other", "#9aa3ad"),
 )
+KNOWN_ACCOUNT_CATEGORIES = tuple(name for name, _kind, _color in ACCOUNT_TYPES)
+INVEST_CATEGORIES = tuple(name for name, kind, _color in ACCOUNT_TYPES if kind == "invest")
+LOAN_CATEGORIES = tuple(name for name, kind, _color in ACCOUNT_TYPES if kind == "loan")
+ACCOUNT_TYPE_KIND = {name: kind for name, kind, _color in ACCOUNT_TYPES}
+ACCOUNT_TYPE_COLOR = {name: color for name, _kind, color in ACCOUNT_TYPES}
 PROPERTY_KINDS = (
     "Primary Home", "Investment Rental", "Vacation Home", "Land",
 )
-LOAN_CATEGORIES = ("Mortgage", "Auto loan", "Student loan")
 _ORIGINATED_ON_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
 _OWNER_MAX_LEN = 40
 _UNSET = object()
@@ -272,6 +306,8 @@ def seed_category_from_name(name: str | None, group_key: str | None = None) -> s
         return "401(k)"
     if "hsa" in n or "health savings" in n:
         return "HSA"
+    if "529" in n:
+        return "529"
     if "crypto" in n:
         return "Crypto"
     if "ira" in n or "rollover" in n:
@@ -322,7 +358,7 @@ def seed_hidden_from_name(name: str | None, conn: sqlite3.Connection | None = No
             if p["role"] == "kid" and (p["name"] or "").strip()
         ]
     if not needles:
-        needles = []
+        needles = ["reeva", "rishvi"]
     for needle in needles:
         if needle and needle in n:
             return 1
@@ -592,6 +628,23 @@ def _table_names(conn: sqlite3.Connection) -> set[str]:
     }
 
 
+
+def _migrate_subcategory(conn: sqlite3.Connection) -> None:
+    """Add subcategory columns without DROP. Safe on every boot."""
+    txn_cols = {r[1] for r in conn.execute("PRAGMA table_info(transactions)")}
+    if "subcategory" not in txn_cols:
+        conn.execute("ALTER TABLE transactions ADD COLUMN subcategory TEXT")
+    rule_cols = {r[1] for r in conn.execute("PRAGMA table_info(category_rules)")}
+    if "subcategory" not in rule_cols:
+        conn.execute("ALTER TABLE category_rules ADD COLUMN subcategory TEXT")
+    try:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_txn_subcat ON transactions(category_name, subcategory)"
+        )
+    except sqlite3.OperationalError:
+        pass
+
+
 def init_db(conn: sqlite3.Connection) -> None:
     tables = _table_names(conn)
     ver = None
@@ -614,6 +667,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         )
     _ensure_people(conn)
     _migrate_account_prefs(conn)
+    _migrate_subcategory(conn)
     seed_missing_prefs(conn)
 
 
@@ -630,6 +684,10 @@ def wipe_ledger(conn: sqlite3.Connection) -> None:
     conn.execute("DELETE FROM budget_categories")
     conn.execute("DELETE FROM categories")
     conn.execute("DELETE FROM syncs")
+    try:
+        conn.execute("DELETE FROM holdings WHERE account_id NOT LIKE 'manual:%'")
+    except sqlite3.OperationalError:
+        pass
     conn.execute("DELETE FROM account_prefs WHERE account_id NOT LIKE 'manual:%'")
     conn.execute("DELETE FROM accounts WHERE account_id NOT LIKE 'manual:%'")
     conn.execute("DELETE FROM meta WHERE key != 'schema_version'")
@@ -727,6 +785,176 @@ def get_account(conn: sqlite3.Connection, account_id: str) -> dict | None:
         return None
     return _attach_loan(conn, found[0])
 
+
+
+def money_string_to_cents(val) -> int | None:
+    """Dollar-like number/string → integer cents. None if it does not look like dollars."""
+    if val is None or val == "":
+        return None
+    if isinstance(val, bool):
+        return None
+    if isinstance(val, int):
+        return val * 100
+    if isinstance(val, float):
+        return int(round(val * 100))
+    s = str(val).strip().replace("$", "").replace(",", "").replace(" ", "")
+    if not s:
+        return None
+    if not re.match(r"^-?\d+(\.\d+)?$", s):
+        return None
+    try:
+        return int(round(float(s) * 100))
+    except (TypeError, ValueError):
+        return None
+
+
+def replace_account_holdings(conn: sqlite3.Connection, account_id: str, recs: list[dict]) -> None:
+    conn.execute("DELETE FROM holdings WHERE account_id = ?", (account_id,))
+    for rec in recs:
+        conn.execute(
+            """
+            INSERT INTO holdings (
+                holding_id, account_id, symbol, description, shares,
+                market_value_cents, cost_basis_cents, purchase_price_cents,
+                currency, created, updated_at_ms
+            ) VALUES (
+                :holding_id, :account_id, :symbol, :description, :shares,
+                :market_value_cents, :cost_basis_cents, :purchase_price_cents,
+                :currency, :created, :updated_at_ms
+            )
+            """,
+            rec,
+        )
+
+
+def is_position_holding(h: dict | None) -> bool:
+    """True if the holding has a ticker and a non-zero market value."""
+    if not h:
+        return False
+    if not str(h.get("symbol") or "").strip():
+        return False
+    mv = h.get("market_value_cents")
+    try:
+        n = int(mv) if mv is not None else 0
+    except (TypeError, ValueError):
+        return False
+    return n != 0
+
+
+def visible_holdings(holdings: list | None) -> list[dict]:
+    return [h for h in (holdings or []) if is_position_holding(h)]
+
+
+def list_holdings(conn: sqlite3.Connection, account_id: str) -> list[dict]:
+    try:
+        return rows(conn.execute(
+            """
+            SELECT holding_id, account_id, symbol, description, shares,
+                   market_value_cents, cost_basis_cents, purchase_price_cents,
+                   currency, created, updated_at_ms
+            FROM holdings
+            WHERE account_id = ?
+            ORDER BY
+                CASE WHEN symbol IS NULL OR TRIM(symbol) = '' THEN 1 ELSE 0 END,
+                symbol COLLATE NOCASE,
+                description COLLATE NOCASE,
+                holding_id
+            """,
+            (account_id,),
+        ))
+    except sqlite3.OperationalError:
+        return []
+
+
+def _holdings_transactions(conn: sqlite3.Connection, account_id: str) -> list[dict]:
+    return list_transactions(
+        conn,
+        window="all",
+        include_investments=True,
+        account_id=account_id,
+        limit=500,
+    )
+
+
+def get_account_detail(conn: sqlite3.Connection, account_id: str) -> dict | None:
+    acct = get_account(conn, account_id)
+    if acct is None:
+        return None
+    loan = acct.get("loan") if isinstance(acct.get("loan"), dict) else None
+    pid = None
+    if loan and loan.get("property_id"):
+        pid = loan.get("property_id")
+    elif acct.get("property_id"):
+        pid = acct.get("property_id")
+    prop = _property_row(conn, pid)
+    holdings = list_holdings(conn, account_id)
+    txns = _holdings_transactions(conn, account_id)
+    from . import lots
+    holdings = visible_holdings(lots.enrich_holdings(holdings, txns))
+    return {
+        "account": acct,
+        "holdings": holdings,
+        "property": prop,
+        "transactions": txns,
+    }
+
+
+def account_types_payload() -> list[dict]:
+    """Catalog for the dashboard: name, kind, color. One list, no JS copies."""
+    return [
+        {"name": name, "kind": kind, "color": color}
+        for name, kind, color in ACCOUNT_TYPES
+    ]
+
+
+def is_invest_account(acct: dict | None) -> bool:
+    """Same rule as accountKind === "invest" in the dashboard."""
+    if not acct:
+        return False
+    cat = str(acct.get("category") or "")
+    gk = str(acct.get("group_key") or "").lower()
+    typ = str(acct.get("type") or "").lower()
+    if (
+        gk == "loans"
+        or typ == "manual_loan"
+        or acct.get("loan")
+        or ACCOUNT_TYPE_KIND.get(cat) == "loan"
+    ):
+        return False
+    if gk in ("investments", "retirement") or ACCOUNT_TYPE_KIND.get(cat) == "invest":
+        return True
+    return False
+
+
+def list_investment_holdings(conn: sqlite3.Connection) -> list[dict]:
+    """Every holding on open investment accounts, with lots from that account's txns.
+
+    Skips closed accounts. Include-off accounts are still returned (hidden=1)
+    so Holdings can show them behind a toggle. Cash, cards, loans, and
+    properties are not investment accounts.
+    """
+    from . import lots
+    out: list[dict] = []
+    for acct in list_accounts(conn, include_closed=True):
+        if acct.get("closed"):
+            continue
+        if not is_invest_account(acct):
+            continue
+        holdings = list_holdings(conn, acct["account_id"])
+        if not holdings:
+            continue
+        txns = _holdings_transactions(conn, acct["account_id"])
+        for h in visible_holdings(lots.enrich_holdings(holdings, txns)):
+            rec = dict(h)
+            rec["account_id"] = acct["account_id"]
+            rec["account_name"] = acct.get("name")
+            rec["display_name"] = acct.get("display_name")
+            rec["owner"] = acct.get("owner")
+            rec["category"] = acct.get("category")
+            rec["hidden"] = 1 if acct.get("hidden") else 0
+            rec.setdefault("lots", [])
+            out.append(rec)
+    return out
 
 
 def is_manual_account_id(account_id: str | None) -> bool:
@@ -1302,6 +1530,7 @@ def delete_manual_account(conn: sqlite3.Connection, account_id: str) -> None:
     if row is None:
         raise KeyError("account not found")
     conn.execute("DELETE FROM loan_terms WHERE account_id = ?", (account_id,))
+    conn.execute("DELETE FROM holdings WHERE account_id = ?", (account_id,))
     conn.execute("DELETE FROM account_prefs WHERE account_id = ?", (account_id,))
     conn.execute("DELETE FROM accounts WHERE account_id = ?", (account_id,))
 
@@ -1651,6 +1880,8 @@ def upsert_category(conn: sqlite3.Connection, rec: dict) -> None:
 
 def upsert_transaction(conn: sqlite3.Connection, rec: dict) -> str:
     """Idempotent on transaction id. Returns 'added' or 'modified'."""
+    rec = dict(rec)
+    rec.setdefault("subcategory", None)
     existing = conn.execute(
         "SELECT first_seen_ms FROM transactions WHERE transaction_id = ?",
         (rec["transaction_id"],),
@@ -1665,12 +1896,12 @@ def upsert_transaction(conn: sqlite3.Connection, rec: dict) -> str:
         """
         INSERT INTO transactions (
             transaction_id, account_id, date, amount_cents, iso_currency,
-            pending, payee, memo, category_id, category_name,
+            pending, payee, memo, category_id, category_name, subcategory,
             transfer_account_id, is_transfer, is_spending, cleared, approved,
             parent_transaction_id, first_seen_ms, last_seen_ms
         ) VALUES (
             :transaction_id, :account_id, :date, :amount_cents, :iso_currency,
-            :pending, :payee, :memo, :category_id, :category_name,
+            :pending, :payee, :memo, :category_id, :category_name, :subcategory,
             :transfer_account_id, :is_transfer, :is_spending, :cleared, :approved,
             :parent_transaction_id, :first_seen_ms, :last_seen_ms
         )
@@ -1688,6 +1919,12 @@ def upsert_transaction(conn: sqlite3.Connection, rec: dict) -> str:
                      AND excluded.category_name != ''
                 THEN excluded.category_name
                 ELSE transactions.category_name
+            END,
+            subcategory = CASE
+                WHEN excluded.subcategory IS NOT NULL
+                     AND TRIM(excluded.subcategory) != ''
+                THEN excluded.subcategory
+                ELSE transactions.subcategory
             END,
             transfer_account_id = excluded.transfer_account_id,
             is_transfer = excluded.is_transfer,
@@ -1800,6 +2037,12 @@ def list_transactions(
     start: str | None = None,
     end: str | None = None,
     spending_only: bool = False,
+    account_id: str | None = None,
+    amount_mode: str = "",
+    amount_lo_cents: int | None = None,
+    amount_hi_cents: int | None = None,
+    sort: str = "date_desc",
+    subcategory: str = "",
 ) -> list[dict]:
     start_s = (start or "").strip()[:10]
     end_s = (end or "").strip()[:10]
@@ -1810,9 +2053,14 @@ def list_transactions(
         extra = extra.replace("AND date", "AND t.date")
     if spending_only:
         extra += " AND t.is_spending = 1 AND t.pending = 0"
-    hide = f" AND {_NOT_HIDDEN}"
-    if not include_investments:
-        hide += _hide_robinhood_sql()
+    if account_id:
+        extra += " AND t.account_id = ?"
+        params.append(account_id)
+        hide = ""
+    else:
+        hide = f" AND {_NOT_HIDDEN}"
+        if not include_investments:
+            hide += _hide_robinhood_sql()
     sql = f"""
         SELECT t.*, a.name AS account_name, a.type AS account_type,
                a.on_budget AS account_on_budget, a.group_key AS account_group,
@@ -1837,7 +2085,38 @@ def list_transactions(
         else:
             sql += " AND t.category_name = ?"
             params.append(category)
-    sql += " ORDER BY t.date DESC, t.transaction_id DESC LIMIT ?"
+    sub = (subcategory or "").strip()
+    if sub:
+        if sub.lower() == "other":
+            sql += " AND (t.subcategory IS NULL OR TRIM(t.subcategory) = '')"
+        else:
+            sql += " AND t.subcategory = ?"
+            params.append(sub)
+    mode = (amount_mode or "").strip().lower()
+    lo = amount_lo_cents
+    hi = amount_hi_cents
+    if mode == "exactly" and lo is not None:
+        sql += " AND ABS(t.amount_cents) = ?"
+        params.append(abs(int(lo)))
+    elif mode == "between" and lo is not None and hi is not None:
+        a, b = abs(int(lo)), abs(int(hi))
+        if a > b:
+            a, b = b, a
+        sql += " AND ABS(t.amount_cents) >= ? AND ABS(t.amount_cents) <= ?"
+        params.extend([a, b])
+    elif mode == "gt" and lo is not None:
+        sql += " AND ABS(t.amount_cents) > ?"
+        params.append(abs(int(lo)))
+    elif mode == "lt" and lo is not None:
+        sql += " AND ABS(t.amount_cents) < ?"
+        params.append(abs(int(lo)))
+    orders = {
+        "date_asc": "t.date ASC, t.transaction_id ASC",
+        "amount_desc": "t.amount_cents DESC, t.date DESC",
+        "amount_asc": "t.amount_cents ASC, t.date DESC",
+    }
+    order = orders.get((sort or "").strip(), "t.date DESC, t.transaction_id DESC")
+    sql += f" ORDER BY {order} LIMIT ?"
     params.append(limit)
     return rows(conn.execute(sql, params))
 
@@ -2052,6 +2331,47 @@ def _page_spend_filter() -> str:
     """
 
 
+
+def _subcat_label(name: str | None) -> str:
+    s = (name or "").strip()
+    return s if s else "Other"
+
+
+def _spend_by_subcategory_range(
+    conn: sqlite3.Connection, start: str, end: str, category: str
+) -> list[dict]:
+    """Named slots under one spend category for the stacked bar."""
+    want = (category or "").strip()
+    if not want or want.lower() == "uncategorized":
+        cat_sql = "(t.category_name IS NULL OR TRIM(t.category_name) = '' OR t.category_name = 'Uncategorized')"
+        params: list = [start, end]
+    else:
+        cat_sql = "TRIM(t.category_name) = ?"
+        params = [want, start, end]
+    rows_out: list[dict] = []
+    total = 0
+    for r in conn.execute(
+        f"""
+        SELECT COALESCE(NULLIF(TRIM(t.subcategory), ''), 'Other') AS subcategory,
+               SUM(t.amount_cents) AS cents
+        FROM transactions t
+        LEFT JOIN account_prefs p ON p.account_id = t.account_id
+        WHERE {_page_spend_filter()} AND {cat_sql}
+          AND t.date >= ? AND t.date < ?
+          AND IFNULL(p.hidden, 0) = 0
+        GROUP BY 1
+        ORDER BY SUM(t.amount_cents) DESC, 1
+        """,
+        params,
+    ):
+        cents = int(r["cents"] or 0)
+        total += cents
+        rows_out.append({"name": _subcat_label(r["subcategory"]), "cents": cents})
+    for row in rows_out:
+        row["pct"] = round(100.0 * row["cents"] / total, 1) if total else 0.0
+    return rows_out
+
+
 def _spend_by_category_range(conn: sqlite3.Connection, start: str, end: str) -> dict[str, int]:
     out: dict[str, int] = {}
     for r in conn.execute(
@@ -2187,6 +2507,7 @@ def spending_report(
             "pct": pct,
             "prev_cents": prev_cents,
             "change_pct": _change_pct(cents, prev_cents),
+            "subcategories": _spend_by_subcategory_range(conn, a, b, name) if cents else [],
         })
     by_category.sort(
         key=lambda r: (
