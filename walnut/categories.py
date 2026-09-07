@@ -1,8 +1,9 @@
 """Payee clustering and category tags.
 
 SimpleFIN has no categories. Walnut groups similar cash/card payees and lets
-you assign a tag. Optional seed rules cover common national merchants. Rules
-apply on sync only when category_name is empty/Uncategorized.
+you assign a tag. The public build ships with no preset categories,
+subcategories, or payee rules — you add them yourself. Rules apply on sync
+only when category_name is empty/Uncategorized.
 
 Investment / Robinhood activity is never auto-tagged as household spend.
 """
@@ -20,83 +21,11 @@ from . import db
 logger = logging.getLogger("walnut.categories")
 
 DEFAULT_TAGS = (
-    "Dining & Drinks",
-    "Groceries",
-    "Auto & Transport",
-    "Shopping",
-    "Entertainment & Rec.",
-    "Health & Wellness",
-    "Personal Care",
-    "Bills & Utilities",
-    "Travel & Vacation",
-    "Family Care",
-    "Home & Garden",
-    "Medical",
-    "Software & Tech",
-    "Education",
-    "Kids",
-    "Charitable Donations",
-    "Fees",
-    "Income",
-    "Transfer (not spend)",
     "Uncategorized",
 )
 
-# Substring (normalized) → tag. Applied on first boot if category_rules is empty.
-SEED_RULES: tuple[tuple[str, ...], ...] = (
-    ("GONG CHA", "Dining & Drinks"),
-    ("DOORDASH", "Dining & Drinks"),
-    ("BOMBAY WALAA", "Dining & Drinks"),
-    ("DOMINO", "Dining & Drinks"),
-    ("CHIPOTLE", "Dining & Drinks"),
-    ("ANGEL DONUTS", "Dining & Drinks"),
-    ("BANGALORE TIFFIN", "Dining & Drinks"),
-    ("DESI CHAAT", "Dining & Drinks"),
-    ("DESI CIRCLE", "Dining & Drinks"),
-    ("JIMMY JOHN", "Dining & Drinks"),
-    ("MILK + TEA", "Dining & Drinks"),
-    ("NEED FOR SWEET", "Dining & Drinks"),
-    ("SHAHGHOUSE", "Dining & Drinks"),
-    ("MENDOCINO", "Dining & Drinks"),
-    ("H-E-B", "Groceries"),
-    ("HEB", "Groceries"),
-    ("INSTACART", "Groceries"),
-    ("MANPASAND", "Groceries"),
-    ("COSTCO", "Groceries"),
-    ("WHOLEFD", "Groceries"),
-    ("WHOLE FOODS", "Groceries"),
-    ("HCTRA", "Auto & Transport"),
-    ("EZ TAG", "Auto & Transport"),
-    ("CHARGEPOINT", "Auto & Transport"),
-    ("UBER *TRIP", "Auto & Transport"),
-    ("TESLA SUBSCRIPTION", "Auto & Transport"),
-    ("AMAZON", "Shopping"),
-    ("CINEPOLIS", "Entertainment & Rec."),
-    ("TYPHOON", "Entertainment & Rec."),
-    ("APPLE.COM", "Entertainment & Rec."),
-    ("NETFLIX", "Entertainment & Rec."),
-    ("YOUTUBE", "Entertainment & Rec."),
-    ("SLING", "Entertainment & Rec."),
-    ("ZILKER", "Entertainment & Rec."),
-    ("AUSTINPICK", "Health & Wellness"),
-    ("FOUR POINTS", "Health & Wellness"),
-    ("YMCA", "Health & Wellness"),
-    ("BRIGHT HORIZONS", "Family Care"),
-    ("TRUGREEN", "Home & Garden"),
-    ("HOME DEPOT", "Home & Garden"),
-    ("POOL POLICE", "Home & Garden"),
-    ("APTIVE", "Home & Garden"),
-    ("OSRX", "Medical"),
-    ("GOOGLE ONE", "Software & Tech"),
-    ("OPENAI", "Software & Tech"),
-    ("CHATGPT", "Software & Tech"),
-    ("ZENBUSINESS", "Software & Tech"),
-    ("ART + ACADEMY", "Education"),
-    ("ART ACADEMY", "Education"),
-    ("SPECTRUM", "Bills & Utilities"),
-    ("BRITISH AIRWAYS", "Travel & Vacation"),
-    ("SPOTIFY", "Entertainment & Rec.", "Music"),
-)
+# Public build: no preset payee → category/subcategory rules.
+SEED_RULES: tuple[tuple[str, ...], ...] = ()
 
 _PROCESSOR_PREFIX = re.compile(
     r"^(?:SQ\s*\*|TST\*|PP\*|DD\s*\*|IC\*|FIV\*)\s*",
@@ -197,23 +126,8 @@ def list_rules(conn: sqlite3.Connection) -> list[dict]:
 
 
 def ensure_seeded(conn: sqlite3.Connection) -> int:
-    """Insert seed rules if the table is empty. Returns number inserted."""
-    n = int(conn.execute("SELECT COUNT(*) FROM category_rules").fetchone()[0])
-    added = 0
-    if not n:
-        for item in SEED_RULES:
-            pattern, category = item[0], item[1]
-            sub = item[2] if len(item) > 2 else None
-            upsert_rule(conn, pattern, category, "seed", subcategory=sub)
-            added += 1
-        logger.info("seeded %s category rules", added)
-    spotify = conn.execute(
-        "SELECT rule_id FROM category_rules WHERE pattern = 'SPOTIFY'"
-    ).fetchone()
-    if not spotify:
-        upsert_rule(conn, "SPOTIFY", "Entertainment & Rec.", "seed", subcategory="Music")
-        added += 1
-    return added
+    """Public build: no preset categories, subcategories, or payee rules."""
+    return 0
 
 
 def match_rule(payee: str | None, rules: list[dict]) -> dict | None:

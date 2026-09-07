@@ -14,7 +14,7 @@ that port to the network.
 - **Investments** — holdings across investment accounts (and crypto)
 - **Spending** — Summary (6-month bars + category pie), By category (stacked subcategory bars with include checkboxes), and Highlights (frequent / largest). Rules support optional subcategories that retag matching payees
 - **Retirement / Net worth** — household, per-person, assets vs liabilities, Blueprint map
-- **Settings** — App (SimpleFIN token + Demo mode), Household (you, partner, kids), Accounts, Categories, Rules
+- **Settings** — App, Household, Accounts, Categories, and Rules. Categories/Rules start empty in the public build (no preset tags or payee rules); you add them yourself. Rules apply on sync including pending; consolidations only on Apply
 - **Recurring** — local detector (same payee, similar amount, regular interval)
 
 **Demo mode** (Settings → App) scales amounts and swaps names so you can screenshot
