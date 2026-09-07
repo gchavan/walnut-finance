@@ -8,8 +8,42 @@ let spendPeriod = "this_month";
 let spendStart = "";
 let spendEnd = "";
 let spendCatFocus = "";
+let spendSubFocus = "";
+let spendSort = "date_desc";
+const SPEND_TABS = [["summary", "Summary"], ["category", "By category"], ["highlights", "Highlights"]];
+const SPEND_TAB_KEY = "walnut-spend-tab";
+const SPEND_HIDDEN_CATS_KEY = "walnut-spend-hidden-cats";
+function readSpendTab() {
+  try {
+    const saved = localStorage.getItem(SPEND_TAB_KEY) || localStorage.getItem("walnut-spend-chart-view");
+    const mode = ({ default: "summary", months: "summary", pie: "summary", bar: "summary", breakdown: "category", stacked: "category" })[saved] || saved;
+    const tab = SPEND_TABS.some(([key]) => key === mode) ? mode : "summary";
+    if (saved !== tab) localStorage.setItem(SPEND_TAB_KEY, tab);
+    return tab;
+  } catch (e) { return "summary"; }
+}
+let spendTab = readSpendTab();
+function setSpendTab(tab) {
+  if (!SPEND_TABS.some(([key]) => key === tab)) return;
+  spendTab = tab;
+  try { localStorage.setItem(SPEND_TAB_KEY, tab); } catch (e) {}
+}
+function readSpendHiddenCats() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(SPEND_HIDDEN_CATS_KEY) || "[]");
+    return new Set(Array.isArray(saved) ? saved.map((key) => String(key)) : []);
+  } catch (e) { return new Set(); }
+}
+function saveSpendHiddenCats(hidden) {
+  try { localStorage.setItem(SPEND_HIDDEN_CATS_KEY, JSON.stringify([...hidden])); } catch (e) {}
+}
 let txnQuery = "";
 let txnCategory = "";
+let txnSort = "date_desc";
+let txnAmount = { mode: "all", lo: "", hi: "" };
+let txnAmtDraft = null;
+let txnAmtOpen = false;
+let invAcctOpen = false;
 let catShowAll = false;
 let acctOwnerFilter = "all";
 let acctVisFilter = "all";
@@ -17,7 +51,7 @@ let householdCache = null;
 let hhAddingPartner = false;
 let hhAddingKid = false;
 
-const ROUTES = ["overview", "transactions", "spending", "retirement", "settings", "recurring"];
+const ROUTES = ["overview", "transactions", "spending", "investments", "retirement", "settings", "recurring"];
 const GROUP_LABELS = {
   cash: "Cash",
   cards: "Credit cards",
@@ -27,13 +61,54 @@ const GROUP_LABELS = {
   other: "Other",
 };
 const GROUP_ORDER = ["cash", "cards", "investments", "retirement", "loans", "other"];
-const ACCT_CAT_ORDER = [
-  "Checking", "Savings", "Credit card", "Taxable",
-  "401(k)", "Roth IRA", "Traditional IRA", "HSA", "Crypto",
-  "Mortgage", "Auto loan", "Student loan", "Other",
-];
 const PROP_KINDS = ["Primary Home", "Investment Rental", "Vacation Home", "Land"];
-const LOAN_CATS = ["Mortgage", "Auto loan", "Student loan"];
+const FALLBACK_ACCOUNT_TYPES = [
+  { name: "Checking", kind: "cash", color: "#4c6fd6" },
+  { name: "Savings", kind: "cash", color: "#3d9a62" },
+  { name: "Credit card", kind: "cash", color: "#d1444a" },
+  { name: "Taxable", kind: "invest", color: "#2d8a9e" },
+  { name: "401(k)", kind: "invest", color: "#8b6cc7" },
+  { name: "Roth IRA", kind: "invest", color: "#2a9d8f" },
+  { name: "Traditional IRA", kind: "invest", color: "#6d72c3" },
+  { name: "HSA", kind: "invest", color: "#3d7ea6" },
+  { name: "529", kind: "invest", color: "#c4a35a" },
+  { name: "Crypto", kind: "invest", color: "#e07040" },
+  { name: "Mortgage", kind: "loan", color: "#5c7c99" },
+  { name: "Auto loan", kind: "loan", color: "#5c7c99" },
+  { name: "Student loan", kind: "loan", color: "#5c7c99" },
+  { name: "Other", kind: "other", color: "#9aa3ad" },
+];
+let ACCOUNT_TYPES = FALLBACK_ACCOUNT_TYPES.slice();
+function applyAccountTypes(list) {
+  if (!Array.isArray(list) || !list.length) return;
+  const next = list.filter((t) => t && t.name);
+  if (next.length) ACCOUNT_TYPES = next;
+}
+function typeNames() { return ACCOUNT_TYPES.map((t) => t.name); }
+function typeKind(name) {
+  const t = ACCOUNT_TYPES.find((x) => x.name === name);
+  return t ? t.kind : "";
+}
+function typeColor(name) {
+  const t = ACCOUNT_TYPES.find((x) => x.name === name);
+  return (t && t.color) || "";
+}
+function loanCats() {
+  return ACCOUNT_TYPES.filter((t) => t.kind === "loan").map((t) => t.name);
+}
+function investGroupOrder() {
+  return ACCOUNT_TYPES.filter((t) => t.kind === "invest" && t.name !== "Crypto").map((t) => t.name);
+}
+function bpClusterOrder() {
+  const out = [];
+  typeNames().forEach((n) => {
+    if (n === "Credit card") out.push("Credit cards");
+    else if (n === "Other") { out.push("Properties"); out.push("Other"); }
+    else out.push(n);
+    if (n === "Taxable") out.push("Robinhood");
+  });
+  return out;
+}
 const SFIN_CREATE = "https://bridge.simplefin.org/simplefin/create";
 const SPEND_TAGS = [
   "Dining & Drinks", "Groceries", "Auto & Transport", "Shopping",
@@ -58,6 +133,18 @@ function parseRoute() {
   const raw = ((location.hash || "#/overview").replace(/^#\/?/, "") || "overview").split("?")[0];
   const parts = raw.split("/").filter(Boolean);
   const head = parts[0] || "overview";
+  if (head === "account") {
+    const joined = parts.slice(1).join("/");
+    let accountId = joined;
+    try { accountId = decodeURIComponent(joined); } catch (e) {}
+    if (!accountId) return { id: "overview", tab: null, canonical: "#/overview" };
+    return {
+      id: "account",
+      tab: null,
+      accountId,
+      canonical: "#/account/" + encodeURIComponent(accountId),
+    };
+  }
   if (head === "categories") {
     return { id: "settings", tab: "categories", canonical: "#/settings/categories" };
   }
@@ -87,6 +174,18 @@ function parseRoute() {
     const tab = (t === "blueprint") ? "blueprint" : "networth";
     const canonical = tab === "blueprint" ? "#/retirement/blueprint" : "#/retirement";
     return { id: "retirement", tab, canonical };
+  }
+  if (head === "investments") {
+    const t = parts[1];
+    const tab = (t === "crypto") ? "crypto" : "holdings";
+    const canonical = tab === "crypto" ? "#/investments/crypto" : "#/investments";
+    return { id: "investments", tab, canonical };
+  }
+  if (head === "spending") {
+    const t = parts[1];
+    const tab = SPEND_TABS.some(([key]) => key === t) ? t : null;
+    const canonical = tab && tab !== "summary" ? "#/spending/" + tab : "#/spending";
+    return { id: "spending", tab, canonical };
   }
   const id = ROUTES.includes(head) ? head : "overview";
   return { id, tab: null, canonical: null };
@@ -142,7 +241,7 @@ function demoAcctName(a) {
   const base = ({
     Checking: "Checking", Savings: "Savings", "Credit card": "Credit card",
     Taxable: "Brokerage", "401(k)": "401(k)", "Roth IRA": "Roth IRA",
-    "Traditional IRA": "IRA", HSA: "HSA", Crypto: "Crypto",
+    "Traditional IRA": "IRA", HSA: "HSA", "529": "529", Crypto: "Crypto",
     Mortgage: "Mortgage", "Auto loan": "Auto loan", "Student loan": "Student loan",
     "Primary Home": "Home", "Investment Rental": "Rental",
     "Vacation Home": "Vacation", Land: "Land",
@@ -163,6 +262,45 @@ function demoPropName(p) {
 }
 function isManualId(id) {
   return String(id || "").startsWith("manual:");
+}
+
+function accountHref(id) {
+  return "#/account/" + encodeURIComponent(id);
+}
+
+function accountKind(a) {
+  const cat = String((a && a.category) || "");
+  const gk = String((a && a.group_key) || "").toLowerCase();
+  const typ = String((a && a.type) || "").toLowerCase();
+  const kind = typeKind(cat);
+  if (
+    gk === "loans" || typ === "manual_loan" || (a && a.loan) || kind === "loan"
+  ) return "loan";
+  if (gk === "investments" || gk === "retirement" || kind === "invest") return "invest";
+  return "cash";
+}
+
+function isAccountHash(h) {
+  return /^#\/account(\/|$)/.test(h || "");
+}
+
+let lastHash = location.hash || "#/overview";
+let backHash = isAccountHash(lastHash) ? "#/overview" : lastHash;
+
+function rememberBackHash(from) {
+  const src = from || lastHash;
+  if (src && !isAccountHash(src)) backHash = src;
+}
+
+function backHref() {
+  const prev = backHash || "#/overview";
+  if (!prev || isAccountHash(prev)) return "#/overview";
+  return prev;
+}
+
+function accountNameLink(id, name, cls) {
+  const klass = cls ? ("acct-link " + cls) : "acct-link";
+  return `<a class="${klass}" href="${esc(accountHref(id))}">${esc(name)}</a>`;
 }
 
 function closeWalnutModal() {
@@ -334,8 +472,20 @@ function setupBanner(st) {
     </div>`;
 }
 
+function isCoverageNotice(msg) {
+  const s = String(msg || "").toLowerCase();
+  if (s.includes("90 day")) return true;
+  if (s.includes("date range exceeds")) return true;
+  if (s.includes("was capped") && (s.includes("range") || s.includes("date") || s.includes("limit"))) return true;
+  return false;
+}
+
 function errlistBanner(st) {
-  const list = (st && st.errlist) || [];
+  const list = ((st && st.errlist) || []).filter((e) => {
+    if (e && e.kind === "notice") return false;
+    const msg = (e && e.msg) ? e.msg : e;
+    return !isCoverageNotice(msg);
+  });
   if (!list.length) return "";
   const items = list.map((e) => {
     const msg = (e && e.msg) ? e.msg : e;
@@ -397,15 +547,25 @@ function syncButton(st) {
   return `<button class="btn" data-act="sync" ${disabled}>Sync</button>`;
 }
 
-async function doSync() {
+function setSyncing(on) {
+  const banner = document.getElementById("sync-banner");
+  if (banner) banner.hidden = !on;
   const btn = view.querySelector('[data-act="sync"]');
-  if (btn) { btn.disabled = true; btn.textContent = "Syncing…"; }
+  if (btn) {
+    btn.disabled = !!on;
+    btn.textContent = on ? "Syncing…" : "Sync";
+  }
+}
+
+async function doSync() {
+  setSyncing(true);
   try {
     await api("/api/sync", { method: "POST", body: "{}" });
     await refresh();
   } catch (err) {
     alert((err.data && err.data.error) || err.message);
-    if (btn) { btn.disabled = false; btn.textContent = "Sync"; }
+  } finally {
+    setSyncing(false);
   }
 }
 
@@ -415,6 +575,7 @@ async function doClaim() {
   if (!token) { alert("Paste a setup token first."); return; }
   const btn = view.querySelector('[data-act="claim"]');
   if (btn) { btn.disabled = true; btn.textContent = "Connecting…"; }
+  setSyncing(true);
   try {
     await api("/api/simplefin/claim", {
       method: "POST",
@@ -425,6 +586,8 @@ async function doClaim() {
   } catch (err) {
     alert((err.data && err.data.error) || err.message);
     if (btn) { btn.disabled = false; btn.textContent = "Connect"; }
+  } finally {
+    setSyncing(false);
   }
 }
 
@@ -479,7 +642,7 @@ async function renderOverview() {
 
   const sub = monthLong(d.this_month) || "";
   view.innerHTML = header("Overview", sub, syncButton(st)) +
-    setupBanner(st) +
+    setupBanner(st) + errlistBanner(st) +
     `<div class="cards">
       <div class="card"><div class="lbl">Net worth</div>
         <div class="val">${cents(nw.net_worth_cents)}</div>
@@ -497,6 +660,265 @@ async function renderOverview() {
   bindChrome();
 }
 
+
+function txnAmountActive() {
+  return txnAmount.mode && txnAmount.mode !== "all";
+}
+function txnAmountDollars(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return "$0";
+  return "$" + n.toLocaleString("en-US", { maximumFractionDigits: 2 });
+}
+function txnAmountLabel() {
+  const m = txnAmount.mode;
+  const lo = txnAmount.lo;
+  const hi = txnAmount.hi;
+  if (m === "exactly" && lo !== "") return "Exactly " + txnAmountDollars(lo);
+  if (m === "between" && lo !== "" && hi !== "") return txnAmountDollars(lo) + " – " + txnAmountDollars(hi);
+  if (m === "gt" && lo !== "") return "Over " + txnAmountDollars(lo);
+  if (m === "lt" && lo !== "") return "Under " + txnAmountDollars(lo);
+  return "All amounts";
+}
+function amountDraft() {
+  return txnAmtDraft || { mode: txnAmount.mode || "all", lo: txnAmount.lo || "", hi: txnAmount.hi || "" };
+}
+function readAmtInputs(root) {
+  const d = amountDraft();
+  const lo = root.querySelector("[data-amt-lo]");
+  const hi = root.querySelector("[data-amt-hi]");
+  if (lo) d.lo = lo.value.trim();
+  if (hi) d.hi = hi.value.trim();
+  txnAmtDraft = d;
+  return d;
+}
+function amountFilterHtml() {
+  const d = amountDraft();
+  const mode = d.mode || "all";
+  const modes = [
+    ["all", "All amounts"],
+    ["exactly", "Exactly"],
+    ["between", "Between"],
+    ["gt", "Greater than"],
+    ["lt", "Less than"],
+  ];
+  const side = modes.map(([v, l]) =>
+    `<button type="button" data-amt-mode="${v}" aria-pressed="${mode === v}">${esc(l)}${mode === v ? '<span class="amt-check">✓</span>' : ""}</button>`
+  ).join("");
+  let main;
+  if (mode === "all") {
+    main = `<p class="amt-help">Show transactions of any amount.</p>`;
+  } else if (mode === "between") {
+    main = `<p class="amt-help">Search for transactions between two amounts.</p>
+      <div class="amt-inputs">
+        <label class="amt-field"><span>$</span><input type="number" min="0" step="0.01" data-amt-lo value="${esc(d.lo)}" placeholder="0"></label>
+        <span class="amt-to">›</span>
+        <label class="amt-field"><span>$</span><input type="number" min="0" step="0.01" data-amt-hi value="${esc(d.hi)}" placeholder="0"></label>
+      </div>
+      <button type="button" class="btn amt-set" data-amt-set>Set Amount</button>`;
+  } else {
+    const help = {
+      exactly: "Search for transactions of an exact amount.",
+      gt: "Search for transactions greater than this amount.",
+      lt: "Search for transactions less than this amount.",
+    }[mode] || "";
+    main = `<p class="amt-help">${help}</p>
+      <div class="amt-inputs">
+        <label class="amt-field"><span>$</span><input type="number" min="0" step="0.01" data-amt-lo value="${esc(d.lo)}" placeholder="0"></label>
+      </div>
+      <button type="button" class="btn amt-set" data-amt-set>Set Amount</button>`;
+  }
+  return `<div class="filter-wrap" id="amt-wrap">
+    <button type="button" class="filter-pill${txnAmountActive() ? " is-on" : ""}" data-amt-toggle aria-expanded="${txnAmtOpen}">${esc(txnAmountLabel())}</button>
+    <div class="filter-pop amt-pop" id="amt-pop"${txnAmtOpen ? "" : " hidden"}>
+      <div class="filter-pop-side">${side}</div>
+      <div class="filter-pop-main">${main}</div>
+    </div>
+  </div>`;
+}
+function sortTh(label, col, current, attr, cls) {
+  const on = String(current || "").indexOf(col) === 0;
+  const dir = /_asc$/.test(current || "") ? "asc" : "desc";
+  const arrow = on ? (dir === "asc" ? " ↑" : " ↓") : "";
+  return `<th class="${esc((cls ? cls + " " : "") + "th-sort")}" aria-sort="${on ? dir : "none"}"><button type="button" data-${attr}="${esc(col)}">${esc(label)}${arrow}</button></th>`;
+}
+function txnSortTh(label, col, cls) {
+  return sortTh(label, col, txnSort, "txn-sort", cls);
+}
+function spendSortTh(label, col, cls) {
+  return sortTh(label, col, spendSort, "spend-sort", cls);
+}
+function nextSort(current, col) {
+  const cur = String(current || "").startsWith(col);
+  const asc = /_asc$/.test(current || "");
+  return col + "_" + (cur && !asc ? "asc" : "desc");
+}
+function bindFilterOutside(wrap) {
+  if (!wrap) return;
+  wrap.addEventListener("click", (e) => e.stopPropagation());
+  const onDoc = (e) => {
+    if (wrap.contains(e.target)) return;
+    const id = wrap.id;
+    if (id === "amt-wrap") {
+      txnAmtOpen = false;
+      txnAmtDraft = null;
+    }
+    if (id === "inv-acct-wrap") invAcctOpen = false;
+    const pop = wrap.querySelector(".filter-pop");
+    if (pop) pop.hidden = true;
+    const tog = wrap.querySelector("[aria-expanded]");
+    if (tog) tog.setAttribute("aria-expanded", "false");
+    document.removeEventListener("click", onDoc, true);
+  };
+  setTimeout(() => document.addEventListener("click", onDoc, true), 0);
+}
+function bindAmountFilter() {
+  const wrap = view.querySelector("#amt-wrap");
+  if (!wrap) return;
+  const pop = wrap.querySelector("#amt-pop");
+  const tog = wrap.querySelector("[data-amt-toggle]");
+  if (tog) {
+    tog.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      txnAmtOpen = !txnAmtOpen;
+      if (!txnAmtOpen) txnAmtDraft = null;
+      else txnAmtDraft = { mode: txnAmount.mode || "all", lo: txnAmount.lo || "", hi: txnAmount.hi || "" };
+      if (pop) pop.hidden = !txnAmtOpen;
+      tog.setAttribute("aria-expanded", txnAmtOpen ? "true" : "false");
+      if (txnAmtOpen) renderTransactions();
+    });
+  }
+  wrap.querySelectorAll("[data-amt-mode]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const next = btn.dataset.amtMode;
+      const d = readAmtInputs(wrap);
+      d.mode = next;
+      txnAmtDraft = d;
+      txnAmtOpen = true;
+      if (next === "all") {
+        txnAmount = { mode: "all", lo: "", hi: "" };
+        txnAmtDraft = null;
+        txnAmtOpen = false;
+        refresh();
+        return;
+      }
+      renderTransactions();
+    });
+  });
+  const setBtn = wrap.querySelector("[data-amt-set]");
+  if (setBtn) {
+    setBtn.addEventListener("click", () => {
+      const d = readAmtInputs(wrap);
+      if (d.mode === "between" && (d.lo === "" || d.hi === "")) return;
+      if (d.mode !== "all" && d.mode !== "between" && d.lo === "") return;
+      txnAmount = { mode: d.mode, lo: d.lo, hi: d.hi };
+      txnAmtDraft = null;
+      txnAmtOpen = false;
+      refresh();
+    });
+  }
+  wrap.querySelectorAll("[data-amt-lo], [data-amt-hi]").forEach((inp) => {
+    inp.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        const btn = wrap.querySelector("[data-amt-set]");
+        if (btn) btn.click();
+      }
+    });
+  });
+  bindFilterOutside(wrap);
+}
+
+function hiddenInvestAcctIds() {
+  try {
+    const v = JSON.parse(localStorage.getItem("walnut-invest-hidden-accts") || "[]");
+    return new Set((Array.isArray(v) ? v : []).map(String));
+  } catch (e) { return new Set(); }
+}
+function setHiddenInvestAcctIds(ids) {
+  try { localStorage.setItem("walnut-invest-hidden-accts", JSON.stringify([...ids])); } catch (e) {}
+}
+function uniqueHoldingAccounts(list) {
+  const m = new Map();
+  (list || []).forEach((h) => {
+    const id = String(h.account_id || "");
+    if (!id || m.has(id)) return;
+    m.set(id, {
+      id,
+      name: acctName(h),
+      owner: ownerName(h.owner || ""),
+      category: h.category || "",
+    });
+  });
+  return [...m.values()].sort((a, b) => String(a.name).localeCompare(String(b.name)));
+}
+function investAcctLabel(accts, hidden) {
+  const vis = accts.filter((a) => !hidden.has(a.id)).length;
+  if (!accts.length || vis === accts.length) return "All accounts";
+  if (vis === 0) return "No accounts";
+  return vis + " of " + accts.length + " accounts";
+}
+function investAcctFilterHtml(accts) {
+  const hidden = hiddenInvestAcctIds();
+  const allOn = accts.length > 0 && accts.every((a) => !hidden.has(a.id));
+  const rows = accts.map((a) => {
+    const on = !hidden.has(a.id);
+    const meta = [a.category, a.owner].filter(Boolean).join(" · ");
+    return `<label class="chk filter-acct">
+      <input type="checkbox" data-inv-acct="${esc(a.id)}" ${on ? "checked" : ""}>
+      <span><span class="nm">${esc(a.name)}</span>${meta ? `<span class="meta">${esc(meta)}</span>` : ""}</span>
+    </label>`;
+  }).join("");
+  return `<div class="filter-wrap" id="inv-acct-wrap">
+    <button type="button" class="filter-pill${allOn ? "" : " is-on"}" data-inv-acct-toggle aria-expanded="${invAcctOpen}">${esc(investAcctLabel(accts, hidden))}</button>
+    <div class="filter-pop inv-acct-pop" id="inv-acct-pop"${invAcctOpen ? "" : " hidden"}>
+      <label class="chk filter-acct all">
+        <input type="checkbox" data-inv-acct-all ${allOn ? "checked" : ""}>
+        <span>All accounts</span>
+      </label>
+      ${rows || `<p class="empty">No accounts.</p>`}
+    </div>
+  </div>`;
+}
+function bindInvestAcctFilter() {
+  const wrap = view.querySelector("#inv-acct-wrap");
+  if (!wrap) return;
+  const pop = wrap.querySelector("#inv-acct-pop");
+  const tog = wrap.querySelector("[data-inv-acct-toggle]");
+  if (tog) {
+    tog.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      invAcctOpen = !invAcctOpen;
+      if (pop) pop.hidden = !invAcctOpen;
+      tog.setAttribute("aria-expanded", invAcctOpen ? "true" : "false");
+    });
+  }
+  wrap.querySelectorAll("[data-inv-acct]").forEach((box) => {
+    box.addEventListener("change", () => {
+      const hide = hiddenInvestAcctIds();
+      if (box.checked) hide.delete(box.dataset.invAcct);
+      else hide.add(box.dataset.invAcct);
+      setHiddenInvestAcctIds(hide);
+      invAcctOpen = true;
+      renderInvestments();
+    });
+  });
+  const all = wrap.querySelector("[data-inv-acct-all]");
+  if (all) {
+    all.addEventListener("change", () => {
+      if (all.checked) setHiddenInvestAcctIds(new Set());
+      else {
+        const ids = [...wrap.querySelectorAll("[data-inv-acct]")].map((b) => b.dataset.invAcct);
+        setHiddenInvestAcctIds(new Set(ids));
+      }
+      invAcctOpen = true;
+      renderInvestments();
+    });
+  }
+  bindFilterOutside(wrap);
+}
+
 function windowSeg(current, which) {
   const chips = [
     ["30d", "30d"], ["90d", "90d"], ["12m", "12m"], ["all", "All"],
@@ -509,9 +931,14 @@ function windowSeg(current, which) {
 
 async function renderTransactions() {
   const st = statusCache;
-  const params = new URLSearchParams({ window: txnWindow });
+  const params = new URLSearchParams({ window: txnWindow, sort: txnSort });
   if (txnQuery) params.set("q", txnQuery);
   if (txnCategory) params.set("category", txnCategory);
+  if (txnAmountActive()) {
+    params.set("amount_mode", txnAmount.mode);
+    if (txnAmount.lo !== "") params.set("amount_lo", txnAmount.lo);
+    if (txnAmount.hi !== "") params.set("amount_hi", txnAmount.hi);
+  }
   const d = await api("/api/transactions?" + params.toString());
   const cats = (d.categories || []).slice();
   if (txnCategory && !cats.includes(txnCategory)) cats.unshift(txnCategory);
@@ -536,7 +963,7 @@ async function renderTransactions() {
       windowSeg(txnWindow, "txn") +
       `<input type="search" id="q" placeholder="Search payee, memo, account" value="${esc(txnQuery)}">` +
       syncButton(st)) +
-    setupBanner(st) +
+    setupBanner(st) + errlistBanner(st) +
     coverageLine(d.coverage, st) +
     `<div class="panel">
       <div class="controls" style="margin-bottom:12px">
@@ -544,9 +971,10 @@ async function renderTransactions() {
           <option value="">All categories</option>
           ${cats.map((c) => `<option value="${esc(c)}" ${c === txnCategory ? "selected" : ""}>${esc(prettyCat(c))}</option>`).join("")}
         </select>
+        ${amountFilterHtml()}
       </div>
       <table>
-        <thead><tr><th>Date</th><th>Payee</th><th>Category</th><th></th><th class="num">Amount</th></tr></thead>
+        <thead><tr>${txnSortTh("Date", "date")}<th>Payee</th><th>Category</th><th></th>${txnSortTh("Amount", "amount", "num")}</tr></thead>
         <tbody>${rows}</tbody>
       </table>
       <p class="note">Showing up to 500. Outflows are red (positive cents = money out). Inflows are green. Robinhood trades hidden (Robinhood and Crypto accounts). Other brokerage / retirement rows show a not-spend badge and are excluded from totals. Assign tags in Settings.</p>
@@ -563,6 +991,13 @@ async function renderTransactions() {
   view.querySelector("#cat").addEventListener("change", (e) => {
     txnCategory = e.target.value; refresh();
   });
+  view.querySelectorAll("[data-txn-sort]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      txnSort = nextSort(txnSort, btn.dataset.txnSort);
+      refresh();
+    });
+  });
+  bindAmountFilter();
 }
 
 function barList(rows, labelKey) {
@@ -596,21 +1031,13 @@ const CAT_COLORS = {
   "Charitable Donations": "#b56576",
   "Fees": "#8a817c",
   "Uncategorized": "#9aa3ad",
-  "Checking": "#4c6fd6",
-  "Savings": "#3d9a62",
-  "Credit card": "#d1444a",
-  "Taxable": "#2d8a9e",
-  "401(k)": "#8b6cc7",
-  "Roth IRA": "#2a9d8f",
-  "Traditional IRA": "#6d72c3",
-  "HSA": "#3d7ea6",
-  "Crypto": "#e07040",
-  "Other": "#9aa3ad",
 };
 const MONTH_SHORT = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
 function catColor(name) {
   const key = prettyCat(name);
+  const fromType = typeColor(key) || typeColor(name);
+  if (fromType) return fromType;
   if (CAT_COLORS[key]) return CAT_COLORS[key];
   let h = 0;
   const s = String(name || "");
@@ -860,8 +1287,81 @@ function bindNwSparklines(root) {
 
 function openSpendCategory(cat) {
   const next = (cat || "Uncategorized").trim() || "Uncategorized";
-  spendCatFocus = (spendCatFocus === next) ? "" : next;
+  if (spendCatFocus === next) {
+    spendCatFocus = "";
+    spendSubFocus = "";
+  } else {
+    spendCatFocus = next;
+    spendSubFocus = "";
+  }
   refresh();
+}
+
+function openSpendSub(sub) {
+  const next = (sub || "").trim();
+  spendSubFocus = (spendSubFocus === next) ? "" : next;
+  refresh();
+}
+
+function spendCategoryTotal(cats, hidden) { return (cats || []).reduce((sum, row) => sum + (hidden.has(row.category || "Uncategorized") ? 0 : (row.cents || 0)), 0); }
+
+function stackedSpendBars(cats, hidden) {
+  const list = (cats || []).filter((r) => (r.cents || 0) > 0);
+  if (!list.length) return `<p class="empty">No spending in this period.</p>`;
+  const included = list.filter((r) => !hidden.has(r.category || "Uncategorized"));
+  const max = Math.max(1, ...included.map((r) => r.cents || 0));
+  return `<div class="stack-bars-wrap"><div class="stack-bars">` + list.map((r) => {
+    const key = r.category || "Uncategorized";
+    const isHidden = hidden.has(key);
+    const on = spendCatFocus && spendCatFocus === key;
+    const width = isHidden ? 0 : Math.max(4, Math.round(100 * (r.cents || 0) / max));
+    const segs = (r.subcategories && r.subcategories.length) ? r.subcategories : [{ name: "Other", cents: r.cents || 0, pct: 100 }];
+    const segHtml = segs.map((s) => {
+      const sub = s.name || "Other";
+      const pct = Math.max(0.5, (100 * (s.cents || 0) / Math.max(1, r.cents || 0)));
+      const subPct = Number.isFinite(Number(s.pct)) ? Number(s.pct).toFixed(1) : pct.toFixed(1);
+      const color = catColor(key + "/" + sub);
+      return `<button type="button" class="stack-seg" data-stack-cat="${esc(key)}" data-stack-sub="${esc(sub)}" data-tip-sub="${esc(sub)}" data-tip-amt="${esc(cents(s.cents))}" data-tip-pct="${subPct}" style="width:${pct}%;background:${color}"${isHidden ? " disabled" : ""}></button>`;
+    }).join("");
+    return `<div class="stack-row${on ? " is-on" : ""}${isHidden ? " is-muted is-hidden" : ""}">
+      <label class="stack-check"><input type="checkbox" data-spend-cat-toggle="${esc(key)}" ${isHidden ? "" : "checked"} aria-label="Include ${esc(prettyCat(key))}"></label>
+      <button type="button" class="stack-label" data-stack-cat="${esc(key)}">${esc(prettyCat(key))}</button>
+      <div class="stack-track" style="width:${width}%">${segHtml}</div>
+      <div class="stack-amt">${cents(r.cents)}</div>
+    </div>`;
+  }).join("") + `</div><div class="stack-tip donut-tip" hidden></div></div>`;
+}
+
+function spendChartHtml(cats, months, selected, total, vs, hidden) {
+  if (spendTab === "category") {
+    const includedTotal = spendCategoryTotal(cats, hidden);
+    const hiddenCount = (cats || []).filter((r) => hidden.has(r.category || "Uncategorized")).length;
+    return `<div class="spend-category-total"><div><div class="lbl">PERIOD TOTAL</div><div class="muted">Included categories only${hiddenCount ? ` · ${hiddenCount} hidden` : ""}</div></div><strong>${cents(includedTotal)}</strong></div>
+      <div class="spend-chart-title"><h2>Spending by category</h2><p class="muted">Check categories to include them in the total. Bars scale to the largest included category.</p></div>${stackedSpendBars(cats, hidden)}`;
+  }
+  return `<div>
+      <h2>Last 6 months</h2>
+      ${monthBarsSvg(months || [], selected)}
+    </div>
+    <div class="donut-wrap">
+      ${donutSvg(cats, total, spendCatFocus)}
+      <div class="donut-center">
+        <div class="donut-lbl">TOTAL SPEND</div>
+        <div class="donut-val">${cents(total)}</div>
+        <div class="donut-delta ${vs.cls}">${esc(vs.text)}</div>
+      </div>
+    </div>`;
+}
+
+function subSlotOpts(category, selected) {
+  const map = (window.__walnutSubcats) || {};
+  const list = (map[category] || []).slice();
+  const cur = (selected || "").trim();
+  if (cur && !list.includes(cur)) list.unshift(cur);
+  const opts = [`<option value="">Other</option>`].concat(
+    list.map((s) => `<option value="${esc(s)}" ${s === cur ? "selected" : ""}>${esc(s)}</option>`)
+  );
+  return opts.join("");
 }
 
 function selectSpendMonth(ym) {
@@ -881,12 +1381,21 @@ function selectSpendMonth(ym) {
 
 async function renderSpending() {
   const st = statusCache;
+  const routeTab = parseRoute().tab;
+  if (routeTab) setSpendTab(routeTab);
+  const hiddenCats = readSpendHiddenCats();
   const params = new URLSearchParams({ period: spendPeriod });
   if (spendPeriod === "custom") {
     if (spendStart) params.set("start", spendStart);
     if (spendEnd) params.set("end", spendEnd);
   }
   const d = await api("/api/spending?" + params.toString());
+  try {
+    const catMeta = await api("/api/categories?all=1");
+    window.__walnutSubcats = catMeta.subcategories || {};
+  } catch (e) {
+    if (!window.__walnutSubcats) window.__walnutSubcats = {};
+  }
   spendPeriod = d.period || spendPeriod;
   if (d.start) spendStart = d.start;
   if (d.end) spendEnd = d.end;
@@ -963,102 +1472,79 @@ async function renderSpending() {
       window: "all",
       category: spendCatFocus,
       spending_only: "1",
+      sort: spendSort,
     });
     if (d.start) tp.set("start", d.start);
     if (d.end) tp.set("end", d.end);
+    if (spendSubFocus) tp.set("subcategory", spendSubFocus);
     const td = await api("/api/transactions?" + tp.toString());
     const trows = (td.transactions || []).map((t) => {
       const cls = t.amount_cents > 0 ? "out" : (t.amount_cents < 0 ? "in" : "");
       const memo = t.memo ? `<div class="muted">${esc(t.memo)}</div>` : "";
+      const txnCat = t.category_name || t.category || spendCatFocus;
+      const txnSub = (t.subcategory || "").trim();
       return `<tr>
         <td>${esc(t.date)}</td>
         <td>${esc(payeeName(t.payee))}${isDemo() ? "" : memo}</td>
         <td>
-          <select class="spend-txn-cat" data-txn="${esc(t.transaction_id)}" data-payee="${esc(t.payee || "")}" data-orig="${esc(prettyCat(t.category_name || t.category))}" aria-label="Category">
-            ${spendTagOpts(t.category_name || t.category)}
+          <select class="spend-txn-cat" data-txn="${esc(t.transaction_id)}" data-payee="${esc(t.payee || "")}" data-orig="${esc(prettyCat(txnCat))}" aria-label="Category">
+            ${spendTagOpts(txnCat)}
+          </select>
+        </td>
+        <td>
+          <select class="spend-txn-sub" data-txn="${esc(t.transaction_id)}" data-orig="${esc(txnSub)}" aria-label="Subcategory">
+            ${subSlotOpts(txnCat, txnSub)}
           </select>
         </td>
         <td class="num ${cls}">${signedCents(t.amount_cents)}</td>
       </tr>`;
-    }).join("") || `<tr><td colspan="4" class="empty">No spending in ${esc(prettyCat(spendCatFocus))} this period.</td></tr>`;
+    }).join("") || `<tr><td colspan="5" class="empty">No spending in ${esc(prettyCat(spendCatFocus))}${spendSubFocus ? " · " + esc(spendSubFocus) : ""} this period.</td></tr>`;
     catPanel = `<div class="panel">
           <div class="panel-head">
-            <h2>${esc(prettyCat(spendCatFocus))}</h2>
+            <h2>${esc(prettyCat(spendCatFocus))}${spendSubFocus ? " · " + esc(spendSubFocus) : ""}</h2>
             <button class="btn ghost small" type="button" id="spend-cat-back">Categories</button>
           </div>
           <table class="spend-txn-table">
-            <thead><tr><th>Date</th><th>Payee</th><th>Category</th><th class="num">Amount</th></tr></thead>
+            <thead><tr>${spendSortTh("Date", "date")}<th>Payee</th><th>Category</th><th>Subcategory</th>${spendSortTh("Amount", "amount", "num")}</tr></thead>
             <tbody>${trows}</tbody>
           </table>
         </div>`;
   }
 
-  view.innerHTML = header("Spending", rangeSub, periodSeg(spendPeriod) + syncButton(st)) +
-    setupBanner(st) +
-    coverageLine(d.coverage, st) +
-    `<div class="spend-layout">
-      <div class="spend-main">
-        <div class="panel spend-charts">
-          <div>
-            <h2>Last 6 months</h2>
-            ${monthBarsSvg(d.by_month || [], selected)}
-          </div>
-          <div class="donut-wrap">
-            ${donutSvg(cats, total, spendCatFocus)}
-            <div class="donut-center">
-              <div class="donut-lbl">TOTAL SPEND</div>
-              <div class="donut-val">${cents(total)}</div>
-              <div class="donut-delta ${vs.cls}">${esc(vs.text)}</div>
-            </div>
-          </div>
+  const tabBody = spendTab === "highlights"
+    ? `<div class="spend-highlights">
+        <div class="panel"><h2>Summary</h2>
+          <div class="sum-row"><div><div class="lbl">Income</div><div class="delta ${incomeDelta.cls}">${esc(incomeDelta.text)}</div></div><div class="val in">${cents(d.income_cents)}</div></div>
+          <div class="sum-row"><div><div class="lbl">Bills</div><div class="delta ${billsDelta.cls}">${esc(billsDelta.text)}</div></div><div class="val">${cents(d.bills_cents)}</div></div>
+          <div class="sum-row"><div><div class="lbl">Spending</div><div class="delta ${spendDelta.cls}">${esc(spendDelta.text)}</div></div><div class="val">${cents(total)}</div></div>
         </div>
-        ${catPanel}
-        <div class="panel">
+        <div class="panel"><h2>Frequent spend</h2>${freq}</div>
+        <div class="panel"><h2>Largest purchases</h2>${largest}</div>
+      </div>`
+    : `<div class="panel spend-charts">
+        <div class="spend-chart-body spend-chart-body-${spendTab}">${spendChartHtml(cats, d.by_month || [], selected, total, vs, hiddenCats)}</div>
+      </div>${spendTab === "summary" ? catPanel + `<div class="panel">
           <h2>Not included in spending</h2>
-          <table>
-            <thead><tr><th>Type</th><th class="num">Amount</th></tr></thead>
-            <tbody>${nonRows}</tbody>
-          </table>
+          <table><thead><tr><th>Type</th><th class="num">Amount</th></tr></thead><tbody>${nonRows}</tbody></table>
           <p class="note">Ignored is investment / Robinhood / retirement outflows. Income is cash and card inflows. Tax Deductible and Reimbursements are $0 until tagged in Settings.</p>
-        </div>
-      </div>
-      <aside class="spend-rail">
-        <div class="panel">
-          <h2>Summary</h2>
-          <div class="sum-row">
-            <div>
-              <div class="lbl">Income</div>
-              <div class="delta ${incomeDelta.cls}">${esc(incomeDelta.text)}</div>
-            </div>
-            <div class="val in">${cents(d.income_cents)}</div>
-          </div>
-          <div class="sum-row">
-            <div>
-              <div class="lbl">Bills</div>
-              <div class="delta ${billsDelta.cls}">${esc(billsDelta.text)}</div>
-            </div>
-            <div class="val">${cents(d.bills_cents)}</div>
-          </div>
-          <div class="sum-row">
-            <div>
-              <div class="lbl">Spending</div>
-              <div class="delta ${spendDelta.cls}">${esc(spendDelta.text)}</div>
-            </div>
-            <div class="val">${cents(total)}</div>
-          </div>
-        </div>
-        <div class="panel">
-          <h2>Frequent spend</h2>
-          ${freq}
-        </div>
-        <div class="panel">
-          <h2>Largest purchases</h2>
-          ${largest}
-        </div>
-      </aside>
+        </div>` : (spendCatFocus ? catPanel : "")}`;
+  view.innerHTML = header("Spending", rangeSub, periodSeg(spendPeriod) + syncButton(st)) +
+    setupBanner(st) + errlistBanner(st) + coverageLine(d.coverage, st) +
+    `<div class="tabs spend-tabs" id="spend-tabs" role="tablist" aria-label="Spending">
+      ${SPEND_TABS.map(([key, label]) => `<button type="button" role="tab" data-t="${key}" aria-selected="${key === spendTab}">${label}</button>`).join("")}
     </div>
+    <div class="spend-layout"><div class="spend-main">${tabBody}</div></div>
     <p class="note">More spend than the prior period is red; less is green. Uncategorized stays last in the table. Assign tags in Settings.</p>`;
   bindChrome();
+
+  view.querySelector("#spend-tabs").addEventListener("click", (e) => {
+    const btn = e.target.closest("button[data-t]");
+    if (!btn) return;
+    const next = btn.dataset.t === "summary" ? "#/spending" : "#/spending/" + btn.dataset.t;
+    setSpendTab(btn.dataset.t);
+    if (location.hash !== next) location.hash = next;
+    else refresh();
+  });
   view.querySelectorAll("[data-seg=sp-period] button").forEach((b) => {
     b.addEventListener("click", () => {
       spendPeriod = b.dataset.p;
@@ -1079,6 +1565,16 @@ async function renderSpending() {
   };
   if (startEl) startEl.addEventListener("change", applyCustom);
   if (endEl) endEl.addEventListener("change", applyCustom);
+  view.querySelectorAll("[data-spend-cat-toggle]").forEach((box) => {
+    box.addEventListener("change", () => {
+      const hidden = readSpendHiddenCats();
+      const key = box.dataset.spendCatToggle || "";
+      if (box.checked) hidden.delete(key);
+      else hidden.add(key);
+      saveSpendHiddenCats(hidden);
+      refresh();
+    });
+  });
   const wrap = view.querySelector(".donut-wrap");
   const tip = view.querySelector(".donut-tip");
   const lbl = view.querySelector(".donut-lbl");
@@ -1118,32 +1614,99 @@ async function renderSpending() {
     });
   });
   const back = view.querySelector("#spend-cat-back");
-  if (back) back.addEventListener("click", () => { spendCatFocus = ""; refresh(); });
+  if (back) back.addEventListener("click", () => { spendCatFocus = ""; spendSubFocus = ""; refresh(); });
+  view.querySelectorAll("[data-spend-cat]").forEach((el) => {
+    el.addEventListener("click", () => openSpendCategory(el.dataset.spendCat || ""));
+  });
+  view.querySelectorAll("[data-stack-cat]").forEach((el) => {
+    el.addEventListener("click", (e) => {
+      e.preventDefault();
+      const cat = el.dataset.stackCat;
+      const sub = el.dataset.stackSub || "";
+      if (sub) {
+        if (spendCatFocus !== cat) spendCatFocus = cat;
+        openSpendSub(sub);
+      } else {
+        openSpendCategory(cat);
+      }
+    });
+  });
+  const stackWrap = view.querySelector(".stack-bars-wrap");
+  const stackTip = view.querySelector(".stack-tip");
+  view.querySelectorAll(".stack-seg").forEach((seg) => {
+    const showStackTip = (e) => {
+      if (!stackTip || !stackWrap) return;
+      stackTip.hidden = false;
+      const sub = seg.dataset.tipSub || "";
+      const amt = seg.dataset.tipAmt || "";
+      const subPct = seg.dataset.tipPct || "";
+      stackTip.textContent = sub + " · " + amt + " · " + subPct + "%";
+      const rect = stackWrap.getBoundingClientRect();
+      stackTip.style.left = Math.min(rect.width - 12, Math.max(8, e.clientX - rect.left + 12)) + "px";
+      stackTip.style.top = Math.min(rect.height - 12, Math.max(8, e.clientY - rect.top + 12)) + "px";
+    };
+    seg.addEventListener("pointerenter", showStackTip);
+    seg.addEventListener("pointermove", showStackTip);
+    seg.addEventListener("pointerleave", () => { if (stackTip) stackTip.hidden = true; });
+  });
+  view.querySelectorAll("[data-spend-sub]").forEach((btn) => {
+    btn.addEventListener("click", () => openSpendSub(btn.dataset.spendSub || ""));
+  });
+  view.querySelectorAll("[data-spend-sort]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      spendSort = nextSort(spendSort, btn.dataset.spendSort);
+      refresh();
+    });
+  });
+  async function saveSpendTxnTag(sel, fields) {
+    const payee = (sel.dataset.payee || "").trim();
+    const catSel = sel.closest("tr").querySelector("select.spend-txn-cat");
+    const subSel = sel.closest("tr").querySelector("select.spend-txn-sub");
+    const cat = (fields.category != null ? fields.category : (catSel && catSel.value) || "").trim();
+    const sub = (fields.subcategory != null ? fields.subcategory : (subSel && subSel.value) || "").trim();
+    if (!cat) return;
+    sel.disabled = true;
+    if (catSel) catSel.disabled = true;
+    if (subSel) subSel.disabled = true;
+    try {
+      if (payee) {
+        await api("/api/categories/apply", {
+          method: "POST",
+          body: JSON.stringify({ cluster_key: payee, category: cat, subcategory: sub }),
+        });
+      } else {
+        await api("/api/categories/tag", {
+          method: "POST",
+          body: JSON.stringify({ transaction_id: sel.dataset.txn, category: cat, subcategory: sub }),
+        });
+      }
+      await refresh();
+    } catch (err) {
+      alert((err.data && err.data.error) || err.message);
+      if (catSel) { catSel.value = catSel.dataset.orig || ""; catSel.disabled = false; }
+      if (subSel) { subSel.value = subSel.dataset.orig || ""; subSel.disabled = false; }
+      sel.disabled = false;
+    }
+  }
   view.querySelectorAll("select.spend-txn-cat").forEach((sel) => {
     sel.addEventListener("change", async () => {
       const cat = (sel.value || "").trim();
       const orig = sel.dataset.orig || "";
       if (!cat || cat === orig) return;
-      sel.disabled = true;
-      try {
-        const payee = (sel.dataset.payee || "").trim();
-        if (payee) {
-          await api("/api/categories/apply", {
-            method: "POST",
-            body: JSON.stringify({ cluster_key: payee, category: cat }),
-          });
-        } else {
-          await api("/api/categories/tag", {
-            method: "POST",
-            body: JSON.stringify({ transaction_id: sel.dataset.txn, category: cat }),
-          });
-        }
-        await refresh();
-      } catch (err) {
-        alert((err.data && err.data.error) || err.message);
-        sel.value = orig;
-        sel.disabled = false;
+      const subSel = sel.closest("tr").querySelector("select.spend-txn-sub");
+      if (subSel) {
+        subSel.innerHTML = subSlotOpts(cat, "");
+        subSel.dataset.orig = "";
       }
+      await saveSpendTxnTag(sel, { category: cat });
+    });
+  });
+  view.querySelectorAll("select.spend-txn-sub").forEach((sel) => {
+    sel.addEventListener("change", async () => {
+      const sub = (sel.value || "").trim();
+      const orig = sel.dataset.orig || "";
+      if (sub === orig) return;
+      await saveSpendTxnTag(sel, { subcategory: sub });
     });
   });
   view.querySelectorAll(".bar-hit").forEach((g) => {
@@ -1180,7 +1743,7 @@ async function renderRecurring() {
 
   view.innerHTML = header("Recurring", "Local detector (same payee, similar amount, regular interval). Ignore drops a false match so it stays gone after Sync.",
       syncButton(st)) +
-    setupBanner(st) +
+    setupBanner(st) + errlistBanner(st) +
     `<div class="panel">
       <table>
         <thead><tr><th>Payee</th><th>Cadence</th><th>Category</th><th>Next</th><th>Status</th><th class="num">Amount</th><th></th></tr></thead>
@@ -1224,8 +1787,8 @@ async function renderSettings() {
     hhAddingKid = false;
   }
 
-  let catData = { tags: [], clusters: [], rules: [], suggestions: [] };
-  let acctData = { accounts: [], owners: [], categories: ACCT_CAT_ORDER.slice() };
+  let catData = { tags: [], clusters: [], rules: [], suggestions: [], subcategories: {} };
+  let acctData = { accounts: [], owners: [], categories: typeNames() };
   const hh = await loadHousehold();
   if (tab === "accounts" || tab === "properties") {
     acctData = await api("/api/accounts");
@@ -1249,7 +1812,7 @@ async function renderSettings() {
   const owners = (acctData.owners && acctData.owners.length)
     ? acctData.owners : (hh.owners || []);
   const acctCats = (acctData.categories && acctData.categories.length)
-    ? acctData.categories : ACCT_CAT_ORDER.slice();
+    ? acctData.categories : typeNames();
   const tagOpts = (selected) => tags.map((t) =>
     `<option value="${esc(t)}" ${t === selected ? "selected" : ""}>${esc(t)}</option>`
   ).join("");
@@ -1359,19 +1922,24 @@ async function renderSettings() {
         ? `<option value="${esc(cat)}" selected>${esc(cat)}</option>` : "";
       const rows = byCat[cat].map((r) => `
         <div class="rule-pat">
-          <input type="text" data-rule-pat="${esc(r.rule_id)}" data-orig="${esc(r.pattern)}" value="${esc(r.pattern)}" autocomplete="off">
+          <input type="text" data-rule-pat="${esc(r.rule_id)}" data-orig="${esc(r.pattern)}" value="${esc(r.pattern)}" autocomplete="off" aria-label="Pattern">
           <select data-rule-cat="${esc(r.rule_id)}" data-orig="${esc(r.category)}" aria-label="Category">${extra}${tagOpts(cat)}</select>
+          <input type="text" class="rule-sub" data-rule-sub="${esc(r.rule_id)}" data-orig="${esc(r.subcategory || "")}" value="${esc(r.subcategory || "")}" placeholder="Subcategory" autocomplete="off" aria-label="Subcategory">
           <span class="badge">${esc(r.source || "")}</span>
         </div>`).join("");
       return `<div class="panel rule-group">
         <h2>${esc(cat)} <span class="muted">${byCat[cat].length}</span></h2>
+        <div class="rule-head">
+          <span>Pattern</span><span>Category</span><span>Subcategory</span><span></span>
+        </div>
         ${rows}
         <div class="rule-pat add">
-          <input type="text" data-add-pat="${esc(cat)}" placeholder="Add pattern" autocomplete="off">
+          <input type="text" data-add-pat="${esc(cat)}" placeholder="Add pattern" autocomplete="off" aria-label="Pattern">
+          <input type="text" class="rule-sub" data-add-sub="${esc(cat)}" placeholder="Subcategory" autocomplete="off" aria-label="Subcategory for new pattern">
         </div>
       </div>`;
     }).join("") || `<p class="empty">No rules yet.</p>`;
-    return suggestionsPanel() + groups;
+    return `<p class="muted rules-note">Subcategory is a named slot on the rule. Saving applies category + subcategory to matching cash/card transactions.</p>` + suggestionsPanel() + groups;
   }
 
   function ownerSeg(current) {
@@ -1440,16 +2008,16 @@ async function renderSettings() {
         ? `<button class="btn ghost small" type="button" data-del-acct="${esc(id)}">Delete</button>` : "";
       const editBtn = isDemo() ? "" :
         `<button class="btn ghost small" type="button" data-edit-acct="${esc(id)}">Edit</button>`;
-      const loanCatSet = new Set(LOAN_CATS);
+      const loanCatSet = new Set(loanCats());
       const extraLoanCat = (a.category && !loanCatSet.has(a.category))
         ? `<option value="${esc(a.category)}" selected>${esc(a.category)}</option>` : "";
-      const loanCatOpts = LOAN_CATS.map((c) =>
+      const loanCatOpts = loanCats().map((c) =>
         `<option value="${esc(c)}" ${c === a.category ? "selected" : ""}>${esc(c)}</option>`
       ).join("");
       return `<div class="acct acct-edit ${hidden || !onBp ? "is-hidden" : ""}">
       <div>
         <div class="nm-row">
-          <div class="nm">${esc(display)}</div>
+          ${accountNameLink(id, display, "nm")}
           ${badges}
         </div>
         <div class="meta">${bits.join(" · ")}</div>
@@ -1478,14 +2046,15 @@ async function renderSettings() {
     const ownerOpts = owners.map((o) =>
       `<option value="${esc(o)}" ${o === a.owner ? "selected" : ""}>${esc(ownerOptionLabel(o))}</option>`
     ).join("");
-    const nameInput = isDemo()
-      ? `<div class="nm">${esc(display)}</div>`
-      : `<input type="text" class="nm-input" data-nick-id="${esc(id)}" data-orig="${esc(display)}" data-bank="${esc(bank)}" value="${esc(display)}" aria-label="Account name" autocomplete="off">`;
-    const meta = nicknamed ? esc(bank) : "";
+    const editName = isDemo() ? "" : `<button type="button" class="nm-edit" data-nick-edit="${esc(id)}" data-orig="${esc(display)}" data-bank="${esc(bank)}" aria-label="Edit name">
+          <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+        </button>`;
+    const meta = esc(bank);
     return `<div class="acct acct-edit ${hidden || !onBp ? "is-hidden" : ""}">
       <div>
         <div class="nm-row">
-          ${nameInput}
+          ${accountNameLink(id, display, "nm")}
+          ${editName}
           ${badges}
         </div>
         <div class="meta">${meta}</div>
@@ -1518,7 +2087,7 @@ async function renderSettings() {
       : "No accounts. Connect, then Sync.";
     const seen = new Set();
     const catKeys = [];
-    ACCT_CAT_ORDER.forEach((k) => { if (groups[k] && groups[k].length) { catKeys.push(k); seen.add(k); } });
+    typeNames().forEach((k) => { if (groups[k] && groups[k].length) { catKeys.push(k); seen.add(k); } });
     Object.keys(groups).sort((a, b) => a.localeCompare(b)).forEach((k) => {
       if (!seen.has(k) && groups[k].length) catKeys.push(k);
     });
@@ -1538,8 +2107,8 @@ async function renderSettings() {
     return `<div class="controls controls-split" style="margin-bottom:14px"><div class="controls">${ownerSeg(acctOwnerFilter)}${visSeg(acctVisFilter)}</div>${addAcct}</div>` +
       body + closedBlock +
       (householdData().joint_label
-        ? `<p class="note">Include is household totals and transactions. Net worth is the family map. Kid-owned accounts default to Include off; Net worth is the family map and stays on unless you turn it off. Edit the account name in place; the bank name stays underneath. Joint accounts are labeled ${esc(householdData().joint_label)}.</p>`
-        : `<p class="note">Include is household totals and transactions. Net worth is the family map. Kid-owned accounts default to Include off; Net worth is the family map and stays on unless you turn it off. Edit the account name in place; the bank name stays underneath.</p>`);
+        ? `<p class="note">Include is household totals and transactions. Net worth is the family map. Kid-owned accounts default to Include off; Net worth is the family map and stays on unless you turn it off. Click the pencil to rename; the bank name stays underneath. Joint accounts are labeled ${esc(householdData().joint_label)}.</p>`
+        : `<p class="note">Include is household totals and transactions. Net worth is the family map. Kid-owned accounts default to Include off; Net worth is the family map and stays on unless you turn it off. Click the pencil to rename; the bank name stays underneath.</p>`);
   }
 
   function ownerSelectOpts(selected) {
@@ -1554,7 +2123,7 @@ async function renderSettings() {
   function loanFormHtml(a) {
     const loan = (a && a.loan) || {};
     const selected = (a && a.category) || "Mortgage";
-    const catOpts = LOAN_CATS.map((c) =>
+    const catOpts = loanCats().map((c) =>
       `<option value="${esc(c)}" ${c === selected ? "selected" : ""}>${esc(c)}</option>`
     ).join("");
     const props = acctData.properties || [];
@@ -1731,10 +2300,64 @@ async function renderSettings() {
         if (input) input.value = orig;
       }
     }
-    view.querySelectorAll("[data-nick-id]").forEach((inp) => {
-      inp.addEventListener("blur", () => saveName(inp.dataset.nickId, inp));
+    function nickLinkHtml(id, name) {
+      return accountNameLink(id, name, "nm");
+    }
+    function restoreNickRow(input) {
+      const row = input.closest(".nm-row");
+      if (!row) return;
+      const id = input.dataset.nickId;
+      const orig = input.dataset.orig || "";
+      const wrap = document.createElement("div");
+      wrap.innerHTML = nickLinkHtml(id, orig);
+      input.replaceWith(wrap.firstElementChild);
+      const btn = row.querySelector("[data-nick-edit]");
+      if (btn) btn.hidden = false;
+    }
+    function bindNickInput(inp) {
+      inp.addEventListener("blur", async () => {
+        const val = (inp.value || "").trim();
+        const orig = inp.dataset.orig || "";
+        if (val === orig) {
+          restoreNickRow(inp);
+          return;
+        }
+        await saveName(inp.dataset.nickId, inp);
+      });
       inp.addEventListener("keydown", (e) => {
         if (e.key === "Enter") { e.preventDefault(); inp.blur(); }
+        if (e.key === "Escape") {
+          e.preventDefault();
+          inp.value = inp.dataset.orig || "";
+          inp.blur();
+        }
+      });
+    }
+    view.querySelectorAll("[data-nick-edit]").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const row = btn.closest(".nm-row");
+        if (!row || row.querySelector("[data-nick-id]")) return;
+        const id = btn.dataset.nickEdit;
+        const orig = btn.dataset.orig || "";
+        const bank = btn.dataset.bank || "";
+        const link = row.querySelector("a.acct-link");
+        const inp = document.createElement("input");
+        inp.type = "text";
+        inp.className = "nm-input";
+        inp.setAttribute("data-nick-id", id);
+        inp.dataset.orig = orig;
+        inp.dataset.bank = bank;
+        inp.value = orig;
+        inp.setAttribute("aria-label", "Account name");
+        inp.autocomplete = "off";
+        if (link) link.replaceWith(inp);
+        else row.insertBefore(inp, btn);
+        btn.hidden = true;
+        bindNickInput(inp);
+        inp.focus();
+        inp.select();
       });
     });
     view.querySelectorAll("[data-edit-acct]").forEach((btn) => {
@@ -2186,23 +2809,35 @@ async function renderSettings() {
       });
     });
     view.querySelectorAll("[data-add-pat]").forEach((inp) => {
+      const row = inp.closest(".rule-pat.add");
+      const subInp = row && row.querySelector("[data-add-sub]");
       const go = async () => {
         const val = (inp.value || "").trim();
-        if (!val) return;
+        if (!val || inp.disabled) return;
+        const sub = subInp ? (subInp.value || "").trim() : "";
         inp.disabled = true;
+        if (subInp) subInp.disabled = true;
         try {
           await api("/api/categories/apply", {
             method: "POST",
-            body: JSON.stringify({ pattern: val, category: inp.dataset.addPat }),
+            body: JSON.stringify({ pattern: val, category: inp.dataset.addPat, subcategory: sub }),
           });
           await refresh();
         } catch (err) {
           alert((err.data && err.data.error) || err.message);
           inp.disabled = false;
+          if (subInp) subInp.disabled = false;
         }
       };
       inp.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); go(); } });
-      inp.addEventListener("blur", go);
+      inp.addEventListener("blur", (e) => {
+        if (subInp && e.relatedTarget === subInp) return;
+        go();
+      });
+      if (subInp) {
+        subInp.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); go(); } });
+        subInp.addEventListener("blur", go);
+      }
     });
     async function patchRule(id, body, ctl) {
       if (ctl) ctl.disabled = true;
@@ -2232,6 +2867,15 @@ async function renderSettings() {
       inp.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); inp.blur(); } });
       inp.addEventListener("blur", go);
     });
+    view.querySelectorAll("[data-rule-sub]").forEach((inp) => {
+      const go = () => {
+        const val = (inp.value || "").trim();
+        if (val === (inp.dataset.orig || "")) return;
+        patchRule(inp.dataset.ruleSub, { subcategory: val }, inp);
+      };
+      inp.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); inp.blur(); } });
+      inp.addEventListener("blur", go);
+    });
   }
 
   const sub = tab === "app" ? "connection and demo mode"
@@ -2239,7 +2883,7 @@ async function renderSettings() {
     : (tab === "properties" ? "register homes and land, then attach a mortgage"
     : (tab === "accounts" ? "nickname, owner, category, include in household" : "payee tags for cash/cards")));
   view.innerHTML = header("Settings", sub, syncButton(st)) +
-    (tab === "app" ? "" : setupBanner(st)) +
+    (tab === "app" ? "" : setupBanner(st)) + errlistBanner(st) +
     `<div class="tabs" id="settings-tabs" role="tablist" aria-label="Settings">
       <button type="button" role="tab" data-t="app" aria-selected="${tab === "app"}">App</button>
       <button type="button" role="tab" data-t="household" aria-selected="${tab === "household"}">Household</button>
@@ -2311,14 +2955,10 @@ async function renderRetirement() {
     if (cat === "Credit card" || a.group_key === "cards" || a.group_key === "loans") return "debt";
     return "bank";
   }
-  const BP_CLUSTER_ORDER = [
-    "Checking", "Savings", "Credit cards", "Taxable", "Robinhood",
-    "401(k)", "Roth IRA", "Traditional IRA", "HSA", "Crypto",
-    "Properties", "Other",
-  ];
-  function bpClusterKey(a) {
+  const BP_CLUSTER_ORDER = bpClusterOrder();
+  function bpClusterKey(a, splitRobinhood) {
     const n = ((a.display_name || "") + " " + (a.name || "")).toLowerCase();
-    if (n.includes("robinhood")) return "Robinhood";
+    if (splitRobinhood && n.includes("robinhood")) return "Robinhood";
     if ((a.category || "") === "Credit card" || a.group_key === "cards") return "Credit cards";
     if (["Primary Home", "Vacation Home", "Investment Rental", "Land"].includes(a.category || "")) return "Properties";
     return a.category || "Other";
@@ -2332,10 +2972,10 @@ async function renderRetirement() {
     }
     return name;
   }
-  function clusterize(list) {
+  function clusterize(list, splitRobinhood) {
     const groups = {};
     list.forEach((a) => {
-      const k = bpClusterKey(a);
+      const k = bpClusterKey(a, splitRobinhood);
       (groups[k] = groups[k] || []).push(a);
     });
     const keys = [];
@@ -2388,7 +3028,7 @@ async function renderRetirement() {
       const a = items[0];
       return `<div class="bp-cluster solo tone-${bpTone(a)}${a.hidden ? " is-hidden" : ""}">
         <div class="bp-cluster-head">
-          <div class="nm">${esc(acctName(a))}</div>
+          <div class="nm">${isPropRow(a) ? esc(acctName(a)) : accountNameLink(a.account_id, acctName(a))}</div>
           ${balCell(a)}
         </div>
       </div>`;
@@ -2396,7 +3036,7 @@ async function renderRetirement() {
     const rows = items.map((a) => {
       const excluded = !!a.hidden;
       return `<div class="bp-line${excluded ? " is-hidden" : ""}">
-        <div class="nm">${esc(bpLineName(a, cluster.key))}</div>
+        <div class="nm">${isPropRow(a) ? esc(bpLineName(a, cluster.key)) : accountNameLink(a.account_id, bpLineName(a, cluster.key))}</div>
         ${balCell(a)}
       </div>`;
     }).join("");
@@ -2410,7 +3050,7 @@ async function renderRetirement() {
   }
   function sortAccts(list) {
     const rank = (a) => {
-      const i = ACCT_CAT_ORDER.indexOf(a.category);
+      const i = typeNames().indexOf(a.category);
       return i < 0 ? 99 : i;
     };
     return list.slice().sort((a, b) => {
@@ -2449,7 +3089,7 @@ async function renderRetirement() {
         const tone = c.items.every((a) => bpTone(a) === "debt") ? "debt" : "bank";
         const lines = c.items.map((a) => `
           <div class="bp-line">
-            <div class="nm">${esc(bpLineName(a, c.key))}</div>
+            <div class="nm">${isPropRow(a) ? esc(bpLineName(a, c.key)) : accountNameLink(a.account_id, bpLineName(a, c.key))}</div>
             ${balCell(a)}
           </div>`).join("");
         return `<div class="bp-cluster tone-${tone} nw-flat">${lines}</div>`;
@@ -2509,7 +3149,7 @@ async function renderRetirement() {
     const nwList = open.filter((a) => !a.hidden && skipSavings(a));
     const total = sumCents(nwList);
     function col(personHtml, list) {
-      const body = clusterize(list).map(bpClusterCard).join("") || `<p class="empty">None</p>`;
+      const body = clusterize(list, true).map(bpClusterCard).join("") || `<p class="empty">None</p>`;
       return `<div class="bp-col">${personHtml}${body}</div>`;
     }
     function personHead(person, demoLetter) {
@@ -2517,7 +3157,7 @@ async function renderRetirement() {
       return `<div class="bp-person"><div class="bp-avatar">${esc(initials(person.name, demoLetter))}</div><div class="nm">${esc(ownerName(person.name))}</div></div>`;
     }
     const kidsBlock = kids.length
-      ? `<div class="bp-kids-lbl">Kids (excluded)</div>${clusterize(kids).map(bpClusterCard).join("")}`
+      ? `<div class="bp-kids-lbl">Kids (excluded)</div>${clusterize(kids, true).map(bpClusterCard).join("")}`
       : "";
     let mid = "";
     if (hh.partner) {
@@ -2533,7 +3173,7 @@ async function renderRetirement() {
             <div class="nm">Jointly held</div>
             <div class="meta">${esc(meta)}</div>
           </div>
-          ${clusterize(joint).map(bpClusterCard).join("") || `<p class="empty">No joint accounts</p>`}
+          ${clusterize(joint, true).map(bpClusterCard).join("") || `<p class="empty">No joint accounts</p>`}
           ${kidsBlock}
         </div>`;
     } else if (kids.length) {
@@ -2556,7 +3196,7 @@ async function renderRetirement() {
   }
 
   view.innerHTML = header("Retirement", tab === "blueprint" ? "household map" : "net worth by type", syncButton(st)) +
-    setupBanner(st) +
+    setupBanner(st) + errlistBanner(st) +
     `<div class="tabs" id="ret-tabs" role="tablist" aria-label="Retirement">
       <button type="button" role="tab" data-t="networth" aria-selected="${tab === "networth"}">Net worth</button>
       <button type="button" role="tab" data-t="blueprint" aria-selected="${tab === "blueprint"}">Blueprint</button>
@@ -2572,13 +3212,487 @@ async function renderRetirement() {
   });
 }
 
+function txnRowsHtml(txns, opts) {
+  const hideCategory = !!(opts && opts.hideCategory);
+  const cols = hideCategory ? 4 : 5;
+  const catHead = hideCategory ? "" : "<th>Category</th>";
+  const rows = (txns || []).map((t) => {
+    const cls = t.amount_cents > 0 ? "out" : (t.amount_cents < 0 ? "in" : "");
+    const badges = [
+      t.pending ? `<span class="badge pending">pending</span>` : "",
+      t.is_transfer ? `<span class="badge">transfer</span>` : "",
+      (!t.is_spending && !t.pending) ? `<span class="badge">not spend</span>` : "",
+    ].join(" ");
+    const catCell = hideCategory ? "" : `<td>${esc(prettyCat(t.category_name))}</td>`;
+    return `<tr>
+      <td>${esc(t.date)}</td>
+      <td>${esc(payeeName(t.payee))}
+        <div class="muted">${(!isDemo() && t.memo) ? esc(t.memo) : ""}</div></td>
+      ${catCell}
+      <td>${badges}</td>
+      <td class="num ${cls}">${signedCents(t.amount_cents)}</td>
+    </tr>`;
+  }).join("") || `<tr><td colspan="${cols}" class="empty">No transactions for this account.</td></tr>`;
+  return `<div class="panel">
+    <h2>Transactions</h2>
+    <table>
+      <thead><tr><th>Date</th><th>Payee</th>${catHead}<th></th><th class="num">Amount</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+  </div>`;
+}
+
+function isPositionHolding(h) {
+  if (!String((h && h.symbol) || "").trim()) return false;
+  const mv = Number(h && h.market_value_cents);
+  return Number.isFinite(mv) && mv !== 0;
+}
+
+function sharesLabel(s) {
+  if (s == null || s === "") return "—";
+  const n = Number(s);
+  if (!Number.isFinite(n)) return String(s);
+  return n.toLocaleString("en-US", { maximumFractionDigits: 8 });
+}
+
+function holdingLots(h) {
+  const lots = Array.isArray(h.lots) ? h.lots : [];
+  if (lots.length) return lots;
+  if (h.purchase_date || (h.purchase_price_cents != null && Number(h.purchase_price_cents) !== 0)) {
+    return [{
+      date: h.purchase_date || "",
+      shares: h.shares,
+      purchase_price_cents: h.purchase_price_cents,
+      cost_basis_cents: h.cost_basis_cents,
+    }];
+  }
+  return [];
+}
+
+function lotMarketValues(h, lots) {
+  const held = Number(h && h.shares);
+  const mv = Number(h && h.market_value_cents);
+  const out = (lots || []).map(() => null);
+  if (!Number.isFinite(held) || held <= 0 || !Number.isFinite(mv)) return out;
+  const idx = [];
+  (lots || []).forEach((lot, i) => {
+    const q = Number(lot.shares);
+    if (!Number.isFinite(q)) return;
+    out[i] = Math.round(mv * (q / held));
+    idx.push(i);
+  });
+  if (idx.length) {
+    const rest = idx.slice(0, -1).reduce((s, i) => s + out[i], 0);
+    out[idx[idx.length - 1]] = mv - rest;
+  }
+  return out;
+}
+
+function lotChildRows(h, lots, opts) {
+  const accountCol = !!(opts && opts.accountCol);
+  const extra = accountCol ? `<td class="muted"></td>` : "";
+  const span = accountCol ? 7 : 6;
+  if (!(lots || []).length) {
+    return `<tr class="hold-lot" hidden>
+      <td class="muted hold-lot-sym" colspan="${span}">No purchase history in this window</td>
+    </tr>`;
+  }
+  const mvs = lotMarketValues(h, lots);
+  return lots.map((lot, i) => {
+    const hasBasis = lot.cost_basis_cents != null && Number(lot.cost_basis_cents) !== 0;
+    const mv = mvs[i];
+    let gl = "—";
+    let glCls = "muted";
+    if (mv != null && hasBasis) {
+      const g = Number(mv) - Number(lot.cost_basis_cents);
+      gl = (g > 0 ? "+" : "") + cents(g);
+      glCls = (g > 0 ? "in" : (g < 0 ? "out" : "")) + " muted";
+    }
+    return `<tr class="hold-lot" hidden>
+      <td class="muted hold-lot-sym">${esc(lot.date || "—")}</td>
+      ${extra}
+      <td class="num muted">${esc(sharesLabel(lot.shares))}</td>
+      <td class="num muted">${cents(lot.purchase_price_cents)}</td>
+      <td class="num muted">${mv == null ? "—" : cents(mv)}</td>
+      <td class="num muted">${hasBasis ? cents(lot.cost_basis_cents) : "—"}</td>
+      <td class="num ${glCls}">${gl}</td>
+    </tr>`;
+  }).join("");
+}
+
+function holdingGain(mv, cb) {
+  const hasBasis = cb != null && Number(cb) !== 0;
+  if (mv == null || !hasBasis) return { hasBasis, gl: "—", glCls: "" };
+  const g = Number(mv) - Number(cb);
+  return {
+    hasBasis,
+    g,
+    gl: (g > 0 ? "+" : "") + cents(g),
+    glCls: g > 0 ? "in" : (g < 0 ? "out" : ""),
+  };
+}
+
+function holdingParentRow(h, opts) {
+  const mv = h.market_value_cents;
+  const cb = h.cost_basis_cents;
+  const { hasBasis, gl, glCls } = holdingGain(mv, cb);
+  const lots = holdingLots(h);
+  const excluded = Number(h.hidden) === 1;
+  const acctCell = (opts && opts.accountCol)
+    ? `<td>${accountNameLink(h.account_id, acctName(h))}${excluded ? ' <span class="badge">Excluded</span>' : ""}</td>`
+    : "";
+  return `<tr class="hold-parent" data-hold-parent tabindex="0" role="button" aria-expanded="false">
+      <td><span class="hold-chevron" aria-hidden="true"></span>${esc(h.symbol || "—")}</td>
+      ${acctCell}
+      <td class="num">${esc(sharesLabel(h.shares))}</td>
+      <td class="num">${cents(h.purchase_price_cents)}</td>
+      <td class="num">${cents(mv)}</td>
+      <td class="num">${hasBasis ? cents(cb) : "—"}</td>
+      <td class="num ${glCls}">${gl}</td>
+    </tr>` + lotChildRows(h, lots, opts);
+}
+
+function holdingsPanel(a, holdings) {
+  const list = (holdings || []).filter(isPositionHolding);
+  if (!list.length) {
+    return `<div class="panel"><h2>Holdings</h2><p class="empty">No holdings.</p></div>`;
+  }
+  let mvSum = 0;
+  const rows = list.map((h) => {
+    if (h.market_value_cents != null) mvSum += Number(h.market_value_cents) || 0;
+    return holdingParentRow(h);
+  }).join("");
+  const residual = (a.current_cents == null ? 0 : Number(a.current_cents)) - mvSum;
+  const resRow = `<tr>
+      <td>Cash / unmapped</td>
+      <td class="num">—</td>
+      <td class="num">—</td>
+      <td class="num">${cents(residual)}</td>
+      <td class="num">—</td>
+      <td class="num">—</td>
+    </tr>`;
+  return `<div class="panel">
+    <h2>Holdings</h2>
+    <table class="holdings-table">
+      <thead><tr><th>Symbol</th><th class="num">Shares</th><th class="num">Price</th><th class="num">Market value</th><th class="num">Cost basis</th><th class="num">Gain / loss</th></tr></thead>
+      <tbody>${rows}${resRow}</tbody>
+    </table>
+  </div>`;
+}
+
+function investGroupMode() {
+  try {
+    const v = localStorage.getItem("walnut-invest-group");
+    if (v === "symbol" || v === "account") return v;
+  } catch (e) {}
+  return "account";
+}
+
+function setInvestGroupMode(mode) {
+  try { localStorage.setItem("walnut-invest-group", mode); } catch (e) {}
+}
+
+let investShowExcluded = false;
+function isHoldingExcluded(h) {
+  return Number(h && h.hidden) === 1;
+}
+
+function investAccountGroup(h) {
+  return h.category || "Other";
+}
+
+function investSymbolGroup(h) {
+  return String(h.symbol || "").trim().toUpperCase() || "—";
+}
+
+function holdingMv(h) {
+  const n = Number(h && h.market_value_cents);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function holdingCb(h) {
+  const n = Number(h && h.cost_basis_cents);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function sortInvestmentHoldings(list) {
+  return (list || []).filter(isPositionHolding).slice().sort((a, b) => {
+    const d = holdingMv(b) - holdingMv(a);
+    if (d) return d;
+    const s = String(a.symbol || "").localeCompare(String(b.symbol || ""), undefined, { sensitivity: "base" });
+    if (s) return s;
+    return String(acctName(a) || "").localeCompare(String(acctName(b) || ""));
+  });
+}
+
+
+function isCryptoHolding(h) {
+  return String((h && h.category) || "") === "Crypto";
+}
+
+function clusterInvestmentHoldings(list, mode) {
+  const items = sortInvestmentHoldings(list);
+  const groups = {};
+  items.forEach((h) => {
+    const k = mode === "symbol" ? investSymbolGroup(h) : investAccountGroup(h);
+    (groups[k] = groups[k] || []).push(h);
+  });
+  let keys;
+  if (mode === "symbol") {
+    keys = Object.keys(groups).sort((a, b) => {
+      const tot = (k) => groups[k].reduce((n, h) => n + holdingMv(h), 0);
+      const d = tot(b) - tot(a);
+      if (d) return d;
+      return a.localeCompare(b);
+    });
+  } else {
+    keys = [];
+    const seen = new Set();
+    investGroupOrder().forEach((k) => { if (groups[k]) { keys.push(k); seen.add(k); } });
+    Object.keys(groups).sort().forEach((k) => { if (!seen.has(k)) keys.push(k); });
+  }
+  return keys.map((k) => ({ key: k, items: groups[k] }));
+}
+
+function holdGroupRow(label, items) {
+  const mv = items.reduce((n, h) => n + holdingMv(h), 0);
+  const cb = items.reduce((n, h) => n + holdingCb(h), 0);
+  const { gl, glCls } = holdingGain(mv, cb);
+  return `<tr class="hold-group">
+      <td colspan="2">${esc(label)}</td>
+      <td class="num"></td>
+      <td class="num"></td>
+      <td class="num">${cents(mv)}</td>
+      <td class="num">${cents(cb)}</td>
+      <td class="num ${glCls}">${gl}</td>
+    </tr>`;
+}
+
+function invToolsHtml(opts, mode) {
+  opts = opts || {};
+  const bits = [];
+  if (opts.accountFilterHtml) bits.push(opts.accountFilterHtml);
+  if (opts.excludedToggle) {
+    bits.push(`<label class="chk"><input type="checkbox" data-inv-excluded ${investShowExcluded ? "checked" : ""}> Excluded accounts</label>`);
+  }
+  if (!opts.flat) {
+    bits.push(`<div class="seg" data-seg="inv-group">
+      <button type="button" data-g="account" aria-pressed="${mode === "account"}">Account</button>
+      <button type="button" data-g="symbol" aria-pressed="${mode === "symbol"}">Symbol</button>
+    </div>`);
+  }
+  if (!bits.length) return "";
+  return `<div class="inv-tools">${bits.join("")}</div>`;
+}
+
+function investmentsHoldingsTable(list, mode, opts) {
+  mode = mode === "symbol" ? "symbol" : "account";
+  opts = opts || {};
+  const flat = !!opts.flat;
+  const title = (opts && opts.title) || "Holdings";
+  const tools = invToolsHtml(opts, mode);
+  const head = `<div class="nw-panel-head"><h2>${esc(title)}</h2>${tools}</div>`;
+  const clusters = flat
+    ? [{ key: "", items: sortInvestmentHoldings(list) }]
+    : clusterInvestmentHoldings(list, mode);
+  if (!clusters.length || !clusters.some((c) => c.items.length)) {
+    const empty = (opts && opts.empty) || "No holdings.";
+    return `<div class="panel">${head}<p class="empty">${esc(empty)}</p></div>`;
+  }
+  let mvSum = 0;
+  let cbSum = 0;
+  const rows = clusters.map((c) => {
+    c.items.forEach((h) => {
+      mvSum += holdingMv(h);
+      cbSum += holdingCb(h);
+    });
+    const head = flat ? "" : holdGroupRow(c.key, c.items);
+    return head + c.items.map((h) => holdingParentRow(h, { accountCol: true })).join("");
+  }).join("");
+  const { gl, glCls } = holdingGain(mvSum, cbSum);
+  const tot = `<tr class="hold-totals">
+      <td>Total</td>
+      <td></td>
+      <td class="num"></td>
+      <td class="num"></td>
+      <td class="num">${cents(mvSum)}</td>
+      <td class="num">${cents(cbSum)}</td>
+      <td class="num ${glCls}">${gl}</td>
+    </tr>`;
+  return `<div class="panel">
+    ${head}
+    <table class="holdings-table">
+      <thead><tr><th>Symbol</th><th>Account</th><th class="num">Shares</th><th class="num">Price</th><th class="num">Market value</th><th class="num">Cost basis</th><th class="num">Gain / loss</th></tr></thead>
+      <tbody>${rows}${tot}</tbody>
+    </table>
+  </div>`;
+}
+
+async function renderInvestments() {
+  const st = statusCache;
+  const parsed = parseRoute();
+  const tab = parsed.tab === "crypto" ? "crypto" : "holdings";
+  const mode = investGroupMode();
+  const data = await api("/api/investments");
+  const all = data.holdings || [];
+  let rows = tab === "crypto"
+    ? all.filter(isCryptoHolding)
+    : all.filter((h) => !isCryptoHolding(h));
+  if (tab === "holdings" && !investShowExcluded) {
+    rows = rows.filter((h) => !isHoldingExcluded(h));
+  }
+  const acctChoices = uniqueHoldingAccounts(rows);
+  if (tab === "holdings") {
+    const hide = hiddenInvestAcctIds();
+    rows = rows.filter((h) => !hide.has(String(h.account_id)));
+  }
+  const body = investmentsHoldingsTable(rows, mode, tab === "crypto"
+    ? { title: "Crypto", empty: "No crypto holdings.", flat: true }
+    : { title: "Holdings", empty: "No holdings.", excludedToggle: true, accountFilterHtml: investAcctFilterHtml(acctChoices) });
+  view.innerHTML = header("Investments", tab === "crypto" ? "crypto" : "holdings across accounts", syncButton(st)) +
+    setupBanner(st) + errlistBanner(st) +
+    `<div class="tabs" id="inv-tabs" role="tablist" aria-label="Investments">
+      <button type="button" role="tab" data-t="holdings" aria-selected="${tab === "holdings"}">Holdings</button>
+      <button type="button" role="tab" data-t="crypto" aria-selected="${tab === "crypto"}">Crypto</button>
+    </div>
+    <div id="inv-body">${body}</div>`;
+  bindChrome();
+  bindHoldingsLots();
+  view.querySelector("#inv-tabs").addEventListener("click", (e) => {
+    const btn = e.target.closest("button");
+    if (!btn) return;
+    const next = btn.dataset.t === "crypto" ? "#/investments/crypto" : "#/investments";
+    if (location.hash !== next) location.hash = next;
+  });
+  const seg = view.querySelector("[data-seg=inv-group]");
+  if (seg) {
+    seg.addEventListener("click", (e) => {
+      const btn = e.target.closest("button[data-g]");
+      if (!btn) return;
+      const next = btn.dataset.g === "symbol" ? "symbol" : "account";
+      if (next === investGroupMode()) return;
+      setInvestGroupMode(next);
+      renderInvestments();
+    });
+  }
+  const ex = view.querySelector("[data-inv-excluded]");
+  if (ex) {
+    ex.addEventListener("change", () => {
+      investShowExcluded = !!ex.checked;
+      renderInvestments();
+    });
+  }
+  bindInvestAcctFilter();
+}
+
+function bindHoldingsLots() {
+  view.querySelectorAll("[data-hold-parent]").forEach((row) => {
+    const toggle = () => {
+      const next = row.getAttribute("aria-expanded") !== "true";
+      row.setAttribute("aria-expanded", next ? "true" : "false");
+      let sib = row.nextElementSibling;
+      while (sib && sib.classList.contains("hold-lot")) {
+        sib.hidden = !next;
+        sib = sib.nextElementSibling;
+      }
+    };
+    row.addEventListener("click", (e) => {
+      if (e.target.closest("a")) return;
+      toggle();
+    });
+    row.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        toggle();
+      }
+    });
+  });
+}
+
+function accountHeaderPanel(a, extraHtml) {
+  const inst = isDemo() ? "" : (a.note || "");
+  const owner = ownerName(a.owner);
+  const cat = a.category || "";
+  const bits = [inst, owner, cat].filter(Boolean).map(esc);
+  const avail = (a.cleared_cents != null && a.cleared_cents !== a.current_cents)
+    ? `<div class="meta">Available ${esc(cents(a.cleared_cents))}</div>` : "";
+  return `<div class="panel">
+    <div class="acct acct-detail-head">
+      <div>
+        <div class="nm">${esc(acctName(a))}</div>
+        <div class="meta">${bits.join(" · ")}</div>
+        ${avail}
+        ${extraHtml || ""}
+      </div>
+      <div class="${balanceClass(a)}">${accountBalanceLabel(a)}</div>
+    </div>
+  </div>`;
+}
+
+async function renderAccountDetail() {
+  const st = statusCache;
+  const parsed = parseRoute();
+  const id = parsed.accountId;
+  const back = `<a class="btn ghost" href="${esc(backHref())}">Back</a>`;
+  if (!id) {
+    view.innerHTML = header("Account", "", back + syncButton(st)) + `<p class="empty">Account not found.</p>`;
+    bindChrome();
+    return;
+  }
+  let d;
+  try {
+    d = await api("/api/accounts/" + encodeURIComponent(id));
+  } catch (err) {
+    if (err.status === 404) {
+      view.innerHTML = header("Account", "", back + syncButton(st)) +
+        `<p class="empty">Account not found.</p>`;
+      bindChrome();
+      return;
+    }
+    throw err;
+  }
+  const a = d.account || d;
+  const kind = accountKind(a);
+  const loan = a.loan;
+  const prop = d.property;
+  let extra = "";
+  if (kind === "loan") {
+    const bits = [];
+    if (prop) {
+      const pname = isDemo() ? demoPropName(prop) : (prop.name || "");
+      bits.push("Property " + esc(pname) + (prop.value_cents != null ? " · " + esc(cents(prop.value_cents)) : ""));
+    } else if (loan && loan.property_name) {
+      bits.push("Property " + esc(isDemo() ? demoPropName({ name: loan.property_name, property_id: loan.property_id }) : loan.property_name));
+    }
+    if (loan) {
+      if (loan.original != null) bits.push("Original " + esc(cents(loan.original)));
+      if (loan.originated_on) bits.push("Originated " + esc(loan.originated_on));
+      if (loan.rate_pct != null) bits.push(esc(Number(loan.rate_pct).toFixed(2)) + "%");
+      if (loan.term_years != null) bits.push(esc(String(loan.term_years)) + " year" + (loan.term_years === 1 ? "" : "s"));
+      if (loan.payment_cents != null) bits.push("P&amp;I " + esc(cents(loan.principal_cents)) + " / " + esc(cents(loan.interest_cents)));
+      if ((a.category || "") === "Mortgage" && loan.piti_cents != null) bits.push("PITI " + esc(cents(loan.piti_cents)));
+    }
+    if (bits.length) extra = `<div class="meta">${bits.join(" · ")}</div>`;
+  }
+  const title = acctName(a) || "Account";
+  let body = accountHeaderPanel(a, extra);
+  if (kind === "invest") body += holdingsPanel(a, d.holdings || []);
+  body += txnRowsHtml(d.transactions || [], { hideCategory: (a.category || "") === "Taxable" });
+  view.innerHTML = header(title, [a.category, ownerName(a.owner)].filter(Boolean).join(" · "), back + syncButton(st)) +
+    setupBanner(st) + errlistBanner(st) + body;
+  bindChrome();
+  bindHoldingsLots();
+}
+
 const PAGES = {
   overview: renderOverview,
   transactions: renderTransactions,
   spending: renderSpending,
+  investments: renderInvestments,
   retirement: renderRetirement,
   settings: renderSettings,
   recurring: renderRecurring,
+  account: renderAccountDetail,
 };
 
 async function refresh() {
@@ -2586,6 +3700,7 @@ async function refresh() {
   const parsed = parseRoute();
   if (parsed.canonical && location.hash !== parsed.canonical) {
     history.replaceState(null, "", parsed.canonical);
+    lastHash = parsed.canonical;
   }
   const name = parsed.id;
   setNav(name);
@@ -2593,6 +3708,7 @@ async function refresh() {
   view.classList.toggle("blueprint", name === "retirement");
   try {
     statusCache = await api("/api/status");
+    applyAccountTypes(statusCache && statusCache.account_types);
     await ensureDemoScale();
     await PAGES[name]();
   } catch (err) {
@@ -2600,6 +3716,14 @@ async function refresh() {
   }
 }
 
-window.addEventListener("hashchange", refresh);
+window.addEventListener("hashchange", (e) => {
+  let from = lastHash;
+  try {
+    if (e && e.oldURL) from = new URL(e.oldURL).hash || from;
+  } catch (err) {}
+  rememberBackHash(from);
+  lastHash = location.hash || "#/overview";
+  refresh();
+});
 if (!location.hash) location.hash = "#/overview";
 refresh();

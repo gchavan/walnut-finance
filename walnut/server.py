@@ -87,6 +87,7 @@ async def handle_status(request: web.Request) -> web.Response:
         "host": cfg.web_host,
         "port": cfg.web_port,
         "account_count": db.account_count(conn),
+        "account_types": db.account_types_payload(),
     }
     payload.update(_source_payload(cfg, conn))
     return _json(payload)
@@ -237,6 +238,7 @@ async def handle_accounts(request: web.Request) -> web.Response:
         "accounts": db.list_accounts(conn),
         "owners": db.list_owners(conn),
         "categories": db.list_account_categories(conn),
+        "account_types": db.account_types_payload(),
         "net_worth": db.net_worth(conn),
         "net_worth_history": db.net_worth_history(conn),
         "household": {
@@ -247,6 +249,21 @@ async def handle_accounts(request: web.Request) -> web.Response:
         },
         "properties": db.list_properties(conn),
     })
+
+
+
+async def handle_investments(request: web.Request) -> web.Response:
+    conn: sqlite3.Connection = request.app["conn"]
+    return _json({"holdings": db.list_investment_holdings(conn)})
+
+
+async def handle_account_detail(request: web.Request) -> web.Response:
+    conn: sqlite3.Connection = request.app["conn"]
+    account_id = request.match_info["account_id"]
+    detail = db.get_account_detail(conn, account_id)
+    if detail is None:
+        return _json({"error": "account not found"}, status=404)
+    return _json(detail)
 
 
 async def handle_account_update(request: web.Request) -> web.Response:
@@ -453,11 +470,31 @@ async def handle_transactions(request: web.Request) -> web.Response:
     spending_only = request.query.get("spending_only", "").strip().lower() in (
         "1", "true", "yes",
     )
+    amount_mode = request.query.get("amount_mode", "").strip().lower()
+    if amount_mode not in ("exactly", "between", "gt", "lt"):
+        amount_mode = ""
+    def _q_cents(key: str):
+        raw = request.query.get(key, "").strip()
+        if raw == "":
+            return None
+        try:
+            return abs(db.dollars_to_cents(raw))
+        except ValueError:
+            return None
+    sort = request.query.get("sort", "").strip()
+    if sort not in ("date_desc", "date_asc", "amount_desc", "amount_asc"):
+        sort = "date_desc"
+    subcategory = request.query.get("subcategory", "").strip()
     txns = db.list_transactions(
         conn, window=window, q=q, category=category,
         include_investments=include_investments,
         start=start or None, end=end or None,
         spending_only=spending_only,
+        amount_mode=amount_mode,
+        amount_lo_cents=_q_cents("amount_lo"),
+        amount_hi_cents=_q_cents("amount_hi"),
+        sort=sort,
+        subcategory=subcategory,
     )
     return _json({
         "transactions": txns,
@@ -467,6 +504,8 @@ async def handle_transactions(request: web.Request) -> web.Response:
         "category": category,
         "include_investments": include_investments,
         "categories": db.list_categories_used(conn),
+        "sort": sort,
+        "amount_mode": amount_mode,
     })
 
 
@@ -487,6 +526,7 @@ async def handle_categories_apply(request: web.Request) -> web.Response:
             category=str(body.get("category") or ""),
             cluster_key=(str(body["cluster_key"]) if body.get("cluster_key") else None),
             pattern=(str(body["pattern"]) if body.get("pattern") else None),
+            subcategory=(str(body["subcategory"]) if body.get("subcategory") is not None else None),
         )
     except ValueError as exc:
         return _json({"error": str(exc)}, status=400)
@@ -505,6 +545,8 @@ async def handle_categories_rule_update(request: web.Request) -> web.Response:
         kw["category"] = str(body.get("category") or "")
     if "pattern" in body:
         kw["pattern"] = str(body.get("pattern") or "")
+    if "subcategory" in body:
+        kw["subcategory"] = body.get("subcategory")
     try:
         result = cats.update_rule(conn, rule_id, **kw)
     except ValueError as exc:
@@ -556,6 +598,7 @@ async def handle_categories_tag(request: web.Request) -> web.Response:
             conn,
             str(body.get("transaction_id") or ""),
             str(body.get("category") or ""),
+            subcategory=(str(body["subcategory"]) if "subcategory" in body else None),
         )
     except ValueError as exc:
         return _json({"error": str(exc)}, status=400)
@@ -613,7 +656,6 @@ async def handle_budgets_get(request: web.Request) -> web.Response:
         "readonly": True,
         "source": "simplefin",
     })
-
 
 
 def _person_id(request: web.Request) -> int:
@@ -694,6 +736,8 @@ def build_app(cfg: Config, conn: sqlite3.Connection) -> web.Application:
     app.router.add_patch("/api/household/people/{person_id}", handle_person_update)
     app.router.add_delete("/api/household/people/{person_id}", handle_person_delete)
     app.router.add_post("/api/accounts/manual", handle_manual_account_create)
+    app.router.add_get("/api/investments", handle_investments)
+    app.router.add_get("/api/accounts/{account_id:.+}", handle_account_detail)
     app.router.add_patch("/api/accounts/{account_id:.+}", handle_account_update)
     app.router.add_post("/api/accounts/{account_id:.+}", handle_account_update)
     app.router.add_delete("/api/accounts/{account_id:.+}", handle_account_delete)

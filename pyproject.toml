@@ -1,7 +1,7 @@
 [project]
 name = "walnut"
 version = "0.1.0"
-description = "Local personal finance super app. Live backend: SimpleFIN Bridge."
+description = "Personal household finance dashboard. Live backend: SimpleFIN Bridge."
 requires-python = ">=3.12"
 dependencies = [
     "aiohttp>=3.10",
